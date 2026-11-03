@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Architecture Reference</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <main class="reference">
+    <nav class="nav-links">
+      <a href="../lessons/0001-the-agent-loop.html">Lesson 1: The Agent Loop</a>
+      <a href="../lessons/0002-the-roadmap.html">Lesson 2: The Roadmap</a>
+      <a href="tool-design.html">Reference: Tool design</a>
+      <a href="../GLOSSARY.md">Glossary</a>
+    </nav>
+
+    <h1>Agent Architecture</h1>
+    <p class="subtitle">The loop, the vocabulary, the wire shapes per protocol, and the three parts. One page, printable.</p>
+
+    <h2>The loop (one turn)</h2>
+    <ol class="step-list">
+      <li>Send the conversation + tool definitions (name, description, JSON Schema).</li>
+      <li>Model replies with text, or with tool calls (id, name, arguments).</li>
+      <li><strong>Your code</strong> runs each requested tool. The model never executes anything.</li>
+      <li>Append one result per call, tied to the call's id. Go to 2.</li>
+      <li>Model replies with text and no tool calls → the turn ends.</li>
+    </ol>
+
+    <h2>Vocabulary</h2>
+    <table>
+      <tr><th>Term</th><th>Means</th><th>Example</th></tr>
+      <tr><td><strong>Provider</strong></td><td>Serves models over HTTP.</td><td>Ollama, llama.cpp server, Anthropic</td></tr>
+      <tr><td><strong>Protocol</strong></td><td>Wire format of a request and response.</td><td>OpenAI Chat Completions, Anthropic Messages</td></tr>
+      <tr><td><strong>Route</strong></td><td>A protocol bound to one provider's endpoint and auth.</td><td>OpenAI protocol at <code>127.0.0.1:11434/v1</code></td></tr>
+      <tr><td><strong>Model</strong></td><td>Specific weights a provider serves.</td><td><code>qwen3.5:9b</code>, <code>claude-sonnet-5-5</code></td></tr>
+      <tr><td><strong>Step</strong></td><td>Exactly one model call, request to response.</td><td>One iteration of your loop</td></tr>
+      <tr><td><strong>Turn</strong></td><td>All steps from a user prompt until the agent goes idle.</td><td>Your whole <code>while</code> loop, once</td></tr>
+    </table>
+
+    <h2>Routes in this course</h2>
+    <table>
+      <tr><th>Provider</th><th>Protocol</th><th>Endpoint</th><th>Start</th></tr>
+      <tr><td>Ollama 0.40.13</td><td>OpenAI Chat Completions</td><td><code>http://127.0.0.1:11434/v1/chat/completions</code></td><td><code>OLLAMA_CONTEXT_LENGTH=32768 ollama serve</code></td></tr>
+      <tr><td>llama.cpp b11669</td><td>OpenAI Chat Completions</td><td><code>http://127.0.0.1:9931/v1/chat/completions</code></td><td><code>llama-server -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M --no-mmproj -c 32768 --port 9931</code></td></tr>
+      <tr><td>Anthropic</td><td>Anthropic Messages</td><td><code>https://api.anthropic.com/v1/messages</code></td><td>Headers <code>x-api-key</code>, <code>anthropic-version: 2023-06-01</code></td></tr>
+    </table>
+    <p class="where">Why two protocols: <a href="../docs/adr/0001-two-protocols-for-three-providers.md">ADR 0001</a>.</p>
+
+    <h2>Wire shapes</h2>
+    <table>
+      <tr><th></th><th>OpenAI Chat Completions</th><th>Anthropic Messages</th></tr>
+      <tr><td>Tool definition</td><td><code>{ type: "function", function: { name, description, parameters } }</code></td><td><code>{ name, description, input_schema }</code></td></tr>
+      <tr><td>Tool call</td><td><code>choices[0].message.tool_calls[i]</code>: <code>id</code>, <code>function.name</code>, <code>function.arguments</code> (JSON string)</td><td><code>content[i]</code>, <code>type: "tool_use"</code>: <code>id</code>, <code>name</code>, <code>input</code> (object)</td></tr>
+      <tr><td>Tool result</td><td><code>{ role: "tool", tool_call_id, content }</code>, one message per call</td><td>One <code>user</code> message: <code>tool_result</code> blocks first (<code>tool_use_id</code>, <code>content</code>)</td></tr>
+      <tr><td>Failure</td><td>No flag: the text is the only signal</td><td><code>is_error: true</code></td></tr>
+      <tr><td>Loop ends when</td><td>No <code>tool_calls</code> on the message</td><td>No <code>tool_use</code> blocks in <code>content</code></td></tr>
+      <tr><td>Reasoning text</td><td><code>reasoning</code> (Ollama), <code>reasoning_content</code> (llama.cpp)</td><td><code>thinking</code> blocks</td></tr>
+    </table>
+    <p class="where">
+      Sources: <a href="https://docs.ollama.com/capabilities/tool-calling" target="_blank" rel="noopener">Ollama tool calling</a>,
+      <a href="https://github.com/ggml-org/llama.cpp/blob/master/docs/function-calling.md" target="_blank" rel="noopener">llama.cpp function calling</a>,
+      <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls" target="_blank" rel="noopener">Claude: Handle tool calls</a>.
+      OpenAI-protocol shapes measured on this Mac, 2026-10-31.
+    </p>
+
+    <h2>The three parts</h2>
+    <table>
+      <tr><th>Part</th><th>Is</th><th>Prevents</th><th>OpenCode</th></tr>
+      <tr>
+        <td><strong>Harness</strong></td>
+        <td>The loop: calls the model, routes tool calls to tools.</td>
+        <td>Brittle, untestable, single-provider agents.</td>
+        <td><code>session/runner/</code>, <code>packages/ai/src/llm.ts</code>, <code>tool.ts</code></td>
+      </tr>
+      <tr>
+        <td><strong>Session</strong></td>
+        <td>Durable log of what happened, outside the process and the context window.</td>
+        <td>Losing work on crash or restart.</td>
+        <td><code>session/inbox.ts</code>, <code>session/execution.ts</code>, <code>session/history.ts</code></td>
+      </tr>
+      <tr>
+        <td><strong>Sandbox</strong></td>
+        <td>Where tools touch the world, behind guardrails, without credentials.</td>
+        <td>The model running anything it proposes.</td>
+        <td><code>permission.ts</code>, tool permission flow in <code>tool/AGENTS.md</code></td>
+      </tr>
+    </table>
+    <p class="where">Source: <a href="https://www.anthropic.com/research/managed-agents" target="_blank" rel="noopener">Anthropic Engineering: Scaling Managed Agents</a></p>
+
+    <h2>Rules worth memorizing</h2>
+    <ul>
+      <li>The model proposes; your code executes. That boundary is the only safety an agent has.</li>
+      <li>Same protocol, different provider: changing the base URL is enough (Ollama ↔ llama.cpp).</li>
+      <li>"OpenAI-compatible" is not identical: field names drift (<code>reasoning</code> vs <code>reasoning_content</code>).</li>
+      <li>Ollama defaults to a 4k context on small machines. Agents need 32k or more; set it explicitly.</li>
+      <li>Claude is the reference: if Claude succeeds where a local model fails, the model is weak; if both fail, suspect the harness.</li>
+      <li>Each step is one model call that continues from <em>reloaded</em> history. No in-memory tool loop (OpenCode).</li>
+      <li>This repo uses Effect <strong>v4</strong>; check the <a href="https://github.com/Effect-TS/effect/blob/main/MIGRATION.md" target="_blank" rel="noopener">migration guide</a> when v3 examples don't fit.</li>
+    </ul>
+  </main>
+</body>
+</html>

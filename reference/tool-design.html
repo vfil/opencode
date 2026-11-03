@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tool Design Reference</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <main class="reference">
+    <nav class="nav-links">
+      <a href="../lessons/0003-tools-as-data.html">Lesson 3: Tools as Data</a>
+      <a href="agent-architecture.html">Reference: Agent architecture</a>
+      <a href="../GLOSSARY.md">Glossary</a>
+    </nav>
+
+    <h1>Tool Design</h1>
+    <p class="subtitle">How to define, register, translate, and fail a tool on every protocol. One page, printable.</p>
+
+    <h2>The shape (provider-neutral)</h2>
+<pre><code>type Tool = {
+  name: string                              // ^[a-zA-Z0-9_-]{1,128}$
+  description: string                       // 3–4+ sentences
+  parameters: Record&lt;string, unknown&gt;       // JSON Schema, shared by both protocols
+  execute: (input: unknown) => Promise&lt;string&gt; // validates its own input
+}
+
+const tools: Tool[] = [listFiles, readFile, writeFile, bash]
+
+// Each protocol's definitions are derived, never written twice
+const toOpenAITool = (t: Tool) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } })
+const toAnthropicTool = (t: Tool) => ({ name: t.name, description: t.description, input_schema: t.parameters })</code></pre>
+
+    <h2>Dispatch (shared by every loop)</h2>
+<pre><code>async function runTool(name: string, rawInput: string | unknown) {
+  const tool = tools.find((t) => t.name === name)
+  if (!tool) return { content: `Unknown tool: ${name}. Available: ${tools.map((t) => t.name).join(", ")}`, isError: true }
+  try {
+    const input = typeof rawInput === "string" ? JSON.parse(rawInput) : rawInput // OpenAI sends a JSON string
+    return { content: await tool.execute(input), isError: false }
+  } catch (e) {
+    return { content: String(e), isError: true }
+  }
+}
+
+// OpenAI protocol:    { role: "tool", tool_call_id: call.id, content: r.isError ? `Error: ${r.content}` : r.content }
+// Anthropic protocol: { type: "tool_result", tool_use_id: block.id, content: r.content, is_error: r.isError }</code></pre>
+
+    <h2>Per protocol</h2>
+    <table>
+      <tr><th></th><th>OpenAI (Ollama, llama.cpp)</th><th>Anthropic (Claude)</th></tr>
+      <tr><td>Schema field</td><td><code>function.parameters</code></td><td><code>input_schema</code></td></tr>
+      <tr><td>Arguments arrive as</td><td>JSON string; parsing can fail</td><td>Object</td></tr>
+      <tr><td>Failure signal</td><td>Text only</td><td><code>is_error: true</code> + text</td></tr>
+      <tr><td>Several calls in one reply</td><td>One <code>role: "tool"</code> message per call</td><td>All <code>tool_result</code> blocks first in one user message</td></tr>
+      <tr><td>Force a tool call</td><td>Ollama: <code>tool_choice</code> unsupported</td><td><code>tool_choice</code>; <code>strict: true</code> for exact schemas</td></tr>
+    </table>
+
+    <h2>Rules</h2>
+    <table>
+      <tr><th>Rule</th><th>Why</th><th>Source</th></tr>
+      <tr>
+        <td>One object per tool: name, description, schema, executor. No protocol inside.</td>
+        <td>Adding a tool never touches a loop or a protocol.</td>
+        <td><a href="../packages/core/src/tool/AGENTS.md">tool/AGENTS.md</a></td>
+      </tr>
+      <tr>
+        <td>Failures are results, never a crash.</td>
+        <td>The model can recover; a crash ends the turn.</td>
+        <td><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls" target="_blank" rel="noopener">Handle tool calls</a></td>
+      </tr>
+      <tr>
+        <td>Errors say what went wrong <em>and what to try next</em>.</td>
+        <td>On the OpenAI protocol the text is the only signal. qwen3.5:9b followed "try 'src' instead" on both local providers.</td>
+        <td><a href="../packages/core/src/tool/plugin/read.ts">read.ts</a>, <a href="../packages/ai/src/protocols/shared.ts">shared.ts</a></td>
+      </tr>
+      <tr>
+        <td>Descriptions: what, when (and when not), each parameter, limits.</td>
+        <td>"By far the most important factor in tool performance." Small models need it more.</td>
+        <td><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools" target="_blank" rel="noopener">Define tools</a></td>
+      </tr>
+      <tr>
+        <td>Validate model input inside the executor, including the JSON parse.</td>
+        <td>The schema guides the model; it doesn't enforce anything.</td>
+        <td><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls" target="_blank" rel="noopener">Handle tool calls</a></td>
+      </tr>
+      <tr>
+        <td>Few tools; high-signal, bounded output (paginate, truncate with a notice).</td>
+        <td>Definitions and results cost context every step; 32k fills fast.</td>
+        <td><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Writing tools for agents</a></td>
+      </tr>
+    </table>
+
+    <h2>Where a tool lives</h2>
+    <p>Definition and dispatch are <strong>harness</strong>. Execution is <strong>sandbox</strong>, which is why permissions attach to execution, not to the registry (<a href="../packages/core/src/tool/AGENTS.md">tool/AGENTS.md</a>, Permissions).</p>
+  </main>
+</body>
+</html>
