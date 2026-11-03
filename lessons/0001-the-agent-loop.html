@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lesson 1: The Agent Loop</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <main class="lesson">
+    <nav class="nav-links">
+      <a href="0002-the-roadmap.html">Next: Lesson 2, The Roadmap →</a>
+      <a href="../reference/agent-architecture.html">Reference: Agent architecture</a>
+      <a href="../GLOSSARY.md">Glossary</a>
+    </nav>
+    <header>
+      <p class="lesson-kicker">Lesson 1 of the mini-OpenCode mission</p>
+      <h1>The Agent Loop</h1>
+      <p class="subtitle">Everything else you'll build (persistence, permissions, tool registries) is scaffolding around one small loop. Learn the loop first, on a model running on your own machine.</p>
+    </header>
+
+    <section>
+      <h2>The claim</h2>
+      <p>
+        An "AI coding agent" sounds like it needs a lot of machinery. At its core, it doesn't.
+        Thorsten Ball built a working one that reads, lists, and edits files in about
+        <a href="https://ampcode.com/how-to-build-an-agent" target="_blank" rel="noopener">400 lines, mostly boilerplate</a>.
+        The loop itself is maybe 20 of those lines.
+      </p>
+      <p>
+        Everything OpenCode adds on top (durable sessions, permission prompts, many providers, retries)
+        exists to make this loop <em>safe</em> and <em>durable</em>, not to replace it.
+      </p>
+    </section>
+
+    <section>
+      <h2>The loop itself</h2>
+      <ol class="step-list">
+        <li>You send the model the conversation so far, plus a list of <strong>tools</strong> it may use. Each tool is a name, a description, and a JSON Schema for its arguments.</li>
+        <li>The model replies. Sometimes that's just text. Sometimes it's a request to call one or more tools: structured data naming each tool and the arguments to call it with.</li>
+        <li>If it's a tool request, <strong>your code</strong> runs the tool (reads the file, lists the directory). The model never executes anything itself.</li>
+        <li>You append the tool's result to the conversation and go back to step 2.</li>
+        <li>Eventually the model replies with text and no tool request. That ends the turn.</li>
+      </ol>
+      <div class="callout">
+        <span class="callout-label">Why this shape</span>
+        The model can only <em>propose</em> actions; your code is always the thing that <em>does</em> them. That boundary is
+        the only safety an agent has, and it's why OpenCode's permission system exists at all.
+      </div>
+      <p>
+        Anthropic's <a href="https://www.anthropic.com/research/building-effective-agents" target="_blank" rel="noopener">"Building effective agents"</a>
+        makes a related point: the teams that succeeded mostly used this loop directly, not elaborate frameworks.
+        (Its tooling details are dated, and the page itself says so, but the loop is not.)
+      </p>
+    </section>
+
+    <section>
+      <h2>Three words before you start</h2>
+      <p>You'll run this loop against three sources of models, so keep these apart from day one (full definitions in the <a href="../GLOSSARY.md">glossary</a>):</p>
+      <ul>
+        <li>A <strong>provider</strong> serves models over HTTP: Ollama, a llama.cpp server, or Anthropic.</li>
+        <li>A <strong>protocol</strong> is the wire format of a request and its response. Ollama and llama.cpp both speak <em>OpenAI Chat Completions</em>; Claude speaks <em>Anthropic Messages</em>.</li>
+        <li>A <strong>model</strong> is a specific set of weights, like <code>qwen3.5:9b</code>.</li>
+      </ul>
+      <p>
+        One provider can speak several protocols, and several providers can share one. Your clone uses two protocols for
+        three providers. That's also how OpenCode reaches local models: its Ollama support only discovers models, and every
+        call goes through its generic OpenAI-compatible protocol
+        (<a href="../packages/core/src/plugin/provider/local.ts">plugin/provider/local.ts</a>).
+      </p>
+    </section>
+
+    <section>
+      <h2>What a tool call looks like on the wire</h2>
+      <p>
+        Here is the OpenAI Chat Completions version, which you'll use for both local providers. These shapes were captured
+        from Ollama 0.40.13 and llama.cpp b11669 running <code>qwen3.5:9b</code>:
+      </p>
+<pre><code>// You POST to {base}/v1/chat/completions:
+{
+  model: "qwen3.5:9b",
+  messages: [{ role: "user", content: "What files are in this directory?" }],
+  tools: [{
+    type: "function",
+    function: {
+      name: "list_files",
+      description: "List the files in a directory…",
+      parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+    }
+  }]
+}
+
+// The reply's choices[0].message:
+{
+  role: "assistant",
+  content: "",
+  tool_calls: [{
+    id: "call_0mnjckd1",
+    type: "function",
+    function: { name: "list_files", arguments: "{\"path\":\".\"}" }   // a JSON *string*
+  }]
+}
+
+// You append that message, run list_files("."), then append:
+{ role: "tool", tool_call_id: "call_0mnjckd1", content: "README.md\nsrc\n…" }</code></pre>
+      <p>
+        That's the whole contract. The agent is a <code>while</code> loop around this exchange, plus functions that actually
+        do <code>list_files</code>. Note that <code>arguments</code> arrives as a string you must <code>JSON.parse</code>.
+      </p>
+    </section>
+
+    <section>
+      <h2>Check yourself</h2>
+
+      <div class="quiz">
+        <p class="quiz-question">The model's reply asks to call <code>edit_file</code>. What happens next?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">The model edits the file directly on the server.</button>
+          <button class="quiz-option" data-correct="true">Your code runs the edit, then returns its result.</button>
+          <button class="quiz-option" data-correct="false">The loop ends immediately once any tool is requested.</button>
+          <button class="quiz-option" data-correct="false">The conversation restarts again from the very first message.</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. The model only proposes; your code always executes." data-wrong-text="Not quite. The model never executes anything. It proposes a call, your code runs it and reports back." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">When does the loop for a single turn stop?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">After exactly one tool call, no matter the task.</button>
+          <button class="quiz-option" data-correct="false">When the prompt runs out of room for tokens.</button>
+          <button class="quiz-option" data-correct="true">When the model replies with text, not tool calls.</button>
+          <button class="quiz-option" data-correct="false">As soon as any tool returns an error result.</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Exactly. The model deciding it's done ends the loop, not a fixed step count." data-wrong-text="Not quite. The loop keeps feeding results back until the model chooses to reply with text only." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">On the OpenAI protocol (Ollama, llama.cpp), how do you hand a tool's output back?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="true">A role tool message with the tool_call_id</button>
+          <button class="quiz-option" data-correct="false">A tool_result block inside the next user message</button>
+          <button class="quiz-option" data-correct="false">A system message that repeats the tool name</button>
+          <button class="quiz-option" data-correct="false">Nothing; the server runs the tool for you</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. A tool_result block inside a user message is the Anthropic protocol's version, which you'll meet in the Claude section." data-wrong-text="It's a message with role &quot;tool&quot; and the call's tool_call_id. The tool_result block is Anthropic's protocol, not OpenAI's." hidden></p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Your turn: build the loop</h2>
+      <p>
+        Do this in its own folder, outside this repo: it's the seed of your mini-OpenCode clone. Plain TypeScript and plain
+        <code>fetch</code>, no SDKs and no Effect yet, so every byte on the wire is visible to you.
+      </p>
+      <ol class="step-list">
+        <li>Install Bun (this Mac doesn't have it yet): <code>curl -fsSL https://bun.com/install | bash</code>, open a new terminal, check <code>bun --version</code> (<a href="https://bun.com/docs/installation" target="_blank" rel="noopener">Bun docs</a>).</li>
+        <li><code>mkdir my-agent &amp;&amp; cd my-agent &amp;&amp; bun init -y</code>.</li>
+      </ol>
+
+      <h3>Ollama: the main path</h3>
+      <ol class="step-list">
+        <li>
+          Start Ollama with a 32k context. Its default is only <strong>4k</strong> tokens on machines with under 24 GiB of
+          VRAM, and Ollama itself says agents need far more
+          (<a href="https://docs.ollama.com/context-length" target="_blank" rel="noopener">context length docs</a>). An agent's
+          history and tool results overflow 4k within a few steps. Quit the Ollama app first, then:
+          <pre><code>OLLAMA_CONTEXT_LENGTH=32768 ollama serve</code></pre>
+        </li>
+        <li>In another terminal: <code>ollama pull qwen3.5:9b</code> (about 7 GB, with tool support).</li>
+        <li>Write <code>list_files(path)</code> first as a plain function from a path to a string (use <code>readdir</code> from <code>node:fs/promises</code>). It has nothing to do with the API.</li>
+        <li>
+          Write the loop: POST to <code>http://127.0.0.1:11434/v1/chat/completions</code> with your <code>messages</code> and
+          one tool. Push the reply's <code>message</code> onto <code>messages</code>. If it has <code>tool_calls</code>, run each one
+          and push a <code>role: "tool"</code> message per call. If it doesn't, print <code>content</code> and stop.
+        </li>
+        <li>
+          Prove it: ask <em>"What files are in this directory?"</em> with a <code>console.log</code> inside
+          <code>list_files</code>, so you can see your function ran instead of the model guessing.
+        </li>
+      </ol>
+      <p>Expect each step to take several seconds on a 16 GB M1. That's the model working, not your code hanging.</p>
+
+      <details class="reveal">
+        <summary>Stuck? A minimal working loop</summary>
+<pre><code>import { readdir } from "node:fs/promises"
+
+const BASE_URL = process.env.BASE_URL ?? "http://127.0.0.1:11434/v1"
+const MODEL = process.env.MODEL ?? "qwen3.5:9b"
+
+const tools = [{
+  type: "function",
+  function: {
+    name: "list_files",
+    description: "List the files in a directory. Use it whenever you need to know which files exist. Returns one name per line. Pass '.' for the current directory.",
+    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+  },
+}]
+
+const listFiles = async (path: string) => {
+  console.log(`[list_files] ${path}`)
+  return (await readdir(path)).join("\n")
+}
+
+const messages: unknown[] = [{ role: "user", content: process.argv[2] ?? "What files are in this directory?" }]
+
+while (true) {
+  const response = await fetch(`${BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: MODEL, messages, tools }),
+  })
+  const message = (await response.json()).choices[0].message
+  messages.push(message)
+  if (!message.tool_calls?.length) {
+    console.log(message.content)
+    break
+  }
+  for (const call of message.tool_calls) {
+    const input = JSON.parse(call.function.arguments)
+    messages.push({ role: "tool", tool_call_id: call.id, content: await listFiles(input.path) })
+  }
+}</code></pre>
+      </details>
+
+      <details class="reveal">
+        <summary>Under the hood: Ollama's own protocol</summary>
+        <p>
+          Ollama also speaks a native protocol at <code>/api/chat</code>
+          (<a href="https://docs.ollama.com/capabilities/tool-calling" target="_blank" rel="noopener">tool calling docs</a>).
+          It's worth seeing once, because it shows that the details are choices, not laws:
+        </p>
+        <ul>
+          <li><code>arguments</code> arrives as an <strong>object</strong>, not a JSON string.</li>
+          <li>Tool calls have <strong>no id</strong>. You return results as <code>{ role: "tool", tool_name: "list_files", content }</code>, matched by name, which gets ambiguous when the model calls the same tool twice in one reply.</li>
+          <li>It streams by default.</li>
+        </ul>
+        <p>
+          Your clone won't use it (see <a href="../docs/adr/0001-two-protocols-for-three-providers.md">ADR 0001</a>). OpenCode
+          doesn't either: it uses <code>/api/tags</code> and <code>/api/show</code> only to discover models.
+        </p>
+      </details>
+
+      <h3>llama.cpp: same protocol, one layer lower</h3>
+      <p>
+        llama.cpp is the inference engine; Ollama wraps an engine with a model registry, background process management, and
+        its own API. With llama.cpp you choose the model file and the flags yourself.
+      </p>
+      <ol class="step-list">
+        <li><code>brew install llama.cpp</code> (already done on this Mac: version 0.7.0, build b11669).</li>
+        <li>
+          Start the server. It downloads the same model as a GGUF file from Hugging Face on first run:
+          <pre><code>llama-server -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M --no-mmproj -c 32768 --port 9931</code></pre>
+          <code>-c 32768</code> sets the context (the default reads it from the model file). <code>--no-mmproj</code> skips the
+          vision part you don't need. 9931 is the default port
+          (<a href="https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md" target="_blank" rel="noopener">server README</a>).
+        </li>
+        <li>Run your <em>unchanged</em> loop with <code>BASE_URL=http://127.0.0.1:9931/v1 bun index.ts</code>.</li>
+      </ol>
+      <p>It should just work, and that's the lesson: <strong>same protocol, different provider</strong>. What differs, as measured on this Mac:</p>
+      <table>
+        <tr><th></th><th>Ollama <code>/v1</code></th><th>llama.cpp <code>/v1</code></th></tr>
+        <tr><td>Model selection</td><td>By the <code>model</code> field</td><td>Fixed at startup; one model per server</td></tr>
+        <tr><td>Reasoning text field</td><td><code>reasoning</code></td><td><code>reasoning_content</code></td></tr>
+        <tr><td>Tool-call ids</td><td>Short (<code>call_0mnjckd1</code>)</td><td>32-character random strings</td></tr>
+      </table>
+      <p>
+        That reasoning field is a small, real example of "OpenAI-compatible" not meaning identical. Your loop ignores it, so
+        it doesn't break, but an agent that displays the model's thinking would need to handle both.
+      </p>
+
+      <h3>Claude: the reference provider (optional, costs money)</h3>
+      <p>
+        Claude is your reference. When a local model gets something wrong, replay the same prompt here: if Claude succeeds,
+        the local model is weak; if Claude fails too, suspect your harness. Use Claude Sonnet 5.5
+        (<code>claude-sonnet-5-5</code>). It speaks a different protocol, Anthropic Messages, so you need a second loop:
+      </p>
+      <div class="compare">
+        <figure>
+          <figcaption>OpenAI Chat Completions (local)</figcaption>
+<pre><code>POST {base}/v1/chat/completions
+tools: [{ type: "function",
+  function: { name, description,
+              parameters } }]
+
+reply.choices[0].message
+  .tool_calls[{ id, function:
+     { name, arguments: "…" } }]
+
+{ role: "tool",
+  tool_call_id, content }
+  // one message per call</code></pre>
+        </figure>
+        <figure>
+          <figcaption>Anthropic Messages (Claude)</figcaption>
+<pre><code>POST api.anthropic.com/v1/messages
+headers: x-api-key, anthropic-version
+body: max_tokens (required)
+tools: [{ name, description,
+          input_schema }]
+
+reply.content[{ type: "tool_use",
+  id, name, input: { … } }]
+
+{ role: "user", content: [
+  { type: "tool_result",
+    tool_use_id, content } ] }
+  // all results in one message</code></pre>
+        </figure>
+      </div>
+      <p class="where">
+        Sources: <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview.md" target="_blank" rel="noopener">Tool use overview</a>,
+        <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls" target="_blank" rel="noopener">Handle tool calls</a>.
+        Set <code>anthropic-version: 2023-06-01</code> and read your key from <code>ANTHROPIC_API_KEY</code>.
+      </p>
+      <p>
+        Write the Claude loop as a <em>separate</em> file and notice how much of it is copied from the local one. That
+        duplication is deliberate. Lesson 4 removes it.
+      </p>
+
+      <div class="callout">
+        <span class="callout-label">If you have 32 GB or more (your M4)</span>
+        Raise the context to 65536 on both servers, as Ollama recommends for agents. Keep <code>qwen3.5:9b</code> as the
+        baseline so results compare across your two Macs, and try a larger local model only as a free second reference.
+      </div>
+      <div class="callout">
+        <span class="callout-label">Tangible win</span>
+        The same 30-line loop runs against two different local providers by changing one URL. Everything from here is "how do we
+        make this loop trustworthy", not "what is the loop".
+      </div>
+    </section>
+
+    <section>
+      <h2>Primary source for this lesson</h2>
+      <p>
+        Ollama's <a href="https://docs.ollama.com/capabilities/tool-calling" target="_blank" rel="noopener">tool calling docs</a>
+        for the provider you'll use most, then Thorsten Ball's
+        <a href="https://ampcode.com/how-to-build-an-agent" target="_blank" rel="noopener">"How to Build an Agent"</a>
+        for the whole loop in one sitting.
+      </p>
+    </section>
+
+    <p class="ask-claude">
+      Stuck, or want to check your loop against this lesson? Ask your teaching session, and bring the actual error or code.
+      A good first question when a local model misbehaves: "is this my loop or the model?"
+    </p>
+
+    <ul class="sources">
+      <li>Source: <a href="https://docs.ollama.com/capabilities/tool-calling" target="_blank" rel="noopener">Ollama docs: Tool calling</a></li>
+      <li>Source: <a href="https://docs.ollama.com/context-length" target="_blank" rel="noopener">Ollama docs: Context length</a></li>
+      <li>Source: <a href="https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md" target="_blank" rel="noopener">llama.cpp server README</a></li>
+      <li>Source: <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls" target="_blank" rel="noopener">Claude docs: Handle tool calls</a></li>
+      <li>Source: <a href="https://ampcode.com/how-to-build-an-agent" target="_blank" rel="noopener">Thorsten Ball: How to Build an Agent</a></li>
+      <li>Source: <a href="https://www.anthropic.com/research/building-effective-agents" target="_blank" rel="noopener">Anthropic: Building effective agents</a></li>
+      <li>Measured: tool-call round trips against Ollama 0.40.13 and llama.cpp b11669 with qwen3.5:9b on an M1 16 GB (2026-10-31).</li>
+    </ul>
+  </main>
+  <script src="../assets/quiz.js"></script>
+</body>
+</html>
