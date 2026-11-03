@@ -1,0 +1,495 @@
+/* Shared lesson stylesheet — Tufte-ish: readable serif prose, generous margins, quiet color. */
+
+:root {
+  --ink: #1a1a1a;
+  --paper: #fdfcf9;
+  --muted: #6b6b6b;
+  --rule: #d8d4c8;
+  --accent: #8a5a2b;
+  --accent-soft: #f3ead9;
+  --code-bg: #f4f2ec;
+  --correct: #2f6f4f;
+  --correct-bg: #e8f3ec;
+  --wrong: #a1402f;
+  --wrong-bg: #f8eae6;
+  --max-width: 720px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e8e6df;
+    --paper: #181715;
+    --muted: #9a968a;
+    --rule: #3a372e;
+    --accent: #d7a35f;
+    --accent-soft: #2a241a;
+    --code-bg: #221f1a;
+    --correct: #7fcf9f;
+    --correct-bg: #1b2b22;
+    --wrong: #e08a73;
+    --wrong-bg: #2e1d18;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  line-height: 1.6;
+  font-size: 18px;
+}
+
+.lesson {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: 3rem 1.5rem 6rem;
+}
+
+.lesson > header {
+  margin-bottom: 2.5rem;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 1.5rem;
+}
+
+.lesson-kicker {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 0.5rem;
+}
+
+.lesson h1 {
+  font-size: 2rem;
+  line-height: 1.2;
+  margin: 0 0 0.5rem;
+}
+
+.subtitle {
+  color: var(--muted);
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+h2 {
+  font-size: 1.3rem;
+  margin-top: 2.5rem;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 0.3rem;
+}
+
+h3 {
+  font-size: 1.05rem;
+  color: var(--accent);
+  margin-top: 1.8rem;
+}
+
+p {
+  margin: 1rem 0;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: var(--rule);
+}
+
+a:hover {
+  text-decoration-color: var(--accent);
+}
+
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.9em;
+  background: var(--code-bg);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+pre {
+  background: var(--code-bg);
+  padding: 1rem 1.2rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+}
+
+blockquote {
+  margin: 1.2rem 0;
+  padding: 0.2rem 1.2rem;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+  font-style: italic;
+}
+
+.callout {
+  background: var(--accent-soft);
+  border-radius: 10px;
+  padding: 1rem 1.3rem;
+  margin: 1.5rem 0;
+}
+
+.callout-label {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  display: block;
+  margin-bottom: 0.4rem;
+}
+
+.step-list {
+  counter-reset: step;
+  list-style: none;
+  padding: 0;
+}
+
+.step-list li {
+  counter-increment: step;
+  position: relative;
+  padding-left: 2.6rem;
+  margin: 1.1rem 0;
+}
+
+.step-list li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: -0.1rem;
+  width: 1.8rem;
+  height: 1.8rem;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.9rem;
+}
+
+.nav-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 2rem 0;
+}
+
+.nav-links a {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  text-decoration: none;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 0.35rem 0.9rem;
+  color: var(--ink);
+}
+
+.nav-links a:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.ask-claude {
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px dashed var(--rule);
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.sources {
+  margin-top: 2.5rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.sources li {
+  margin: 0.3rem 0;
+}
+
+.quiz {
+  background: var(--code-bg);
+  border-radius: 10px;
+  padding: 1.3rem 1.4rem;
+  margin: 1.8rem 0;
+}
+
+.quiz-question {
+  font-weight: 600;
+  margin-top: 0;
+}
+
+.quiz-options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.quiz-option {
+  font-family: inherit;
+  font-size: 0.95rem;
+  text-align: left;
+  padding: 0.55rem 0.9rem;
+  border-radius: 7px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.quiz-option:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.quiz-option:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.quiz-option.quiz-correct {
+  border-color: var(--correct);
+  background: var(--correct-bg);
+  opacity: 1;
+  font-weight: 600;
+}
+
+.quiz-option.quiz-wrong {
+  border-color: var(--wrong);
+  background: var(--wrong-bg);
+  opacity: 1;
+}
+
+.quiz-feedback {
+  margin-top: 0.8rem;
+  margin-bottom: 0;
+  font-size: 0.9rem;
+}
+
+.quiz-feedback[hidden] {
+  display: none;
+}
+
+.quiz-feedback-correct {
+  color: var(--correct);
+}
+
+.quiz-feedback-wrong {
+  color: var(--wrong);
+}
+
+/* Roadmap: stages of modules with done / next / later status. */
+.roadmap {
+  margin: 1.5rem 0;
+}
+
+.stage {
+  margin: 2rem 0;
+}
+
+.stage-title {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 0.3rem;
+}
+
+.stage-why {
+  color: var(--muted);
+  font-size: 0.95rem;
+  margin: 0 0 1rem;
+}
+
+.module {
+  position: relative;
+  border-left: 2px solid var(--rule);
+  padding: 0.2rem 0 1.1rem 1.4rem;
+  margin-left: 0.5rem;
+}
+
+.module::before {
+  content: "";
+  position: absolute;
+  left: -7px;
+  top: 0.45rem;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--paper);
+  border: 2px solid var(--rule);
+}
+
+.module.done::before {
+  background: var(--correct);
+  border-color: var(--correct);
+}
+
+.module.next::before {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.module h4 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.module .status {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-left: 0.4rem;
+}
+
+.module p {
+  margin: 0.3rem 0;
+  font-size: 0.95rem;
+}
+
+.module .milestone::before {
+  content: "Milestone: ";
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.where {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.prompt-box {
+  border: 1px dashed var(--accent);
+  border-radius: 10px;
+  padding: 1rem 1.3rem;
+  margin: 1.2rem 0;
+}
+
+/* Reveal: click to show an answer after committing to a guess. */
+details.reveal {
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  padding: 0.8rem 1.2rem;
+  margin: 1rem 0;
+}
+
+details.reveal summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+details.reveal[open] summary {
+  margin-bottom: 0.6rem;
+}
+
+/* Compare: two code panels side by side, stacked on narrow screens. */
+.compare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.compare figure {
+  margin: 0;
+  min-width: 0;
+}
+
+.compare figcaption {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+
+.compare pre {
+  margin: 0;
+  height: 100%;
+}
+
+@media (max-width: 700px) {
+  .compare {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Reference sheets: denser, print-friendly. */
+.reference {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 4rem;
+  font-size: 16px;
+}
+
+.reference h1 {
+  font-size: 1.6rem;
+  margin: 0 0 0.3rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+  margin: 1rem 0;
+  display: block;
+  overflow-x: auto;
+}
+
+th,
+td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+th {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+@media print {
+  body {
+    background: #fff;
+    color: #000;
+    font-size: 12pt;
+  }
+  .nav-links,
+  .ask-claude,
+  .quiz {
+    display: none;
+  }
+  pre {
+    white-space: pre-wrap;
+  }
+  a {
+    color: #000;
+  }
+}

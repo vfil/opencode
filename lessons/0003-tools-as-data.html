@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lesson 3: Tools as Data</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <main class="lesson">
+    <nav class="nav-links">
+      <a href="0002-the-roadmap.html">← Lesson 2: The Roadmap</a>
+      <a href="../reference/agent-architecture.html">Reference: Agent architecture</a>
+      <a href="../reference/tool-design.html">Reference: Tool design</a>
+      <a href="../GLOSSARY.md">Glossary</a>
+    </nav>
+
+    <header>
+      <p class="lesson-kicker">Lesson 3 · Stage A · Harness</p>
+      <h1>Tools as Data</h1>
+      <p class="subtitle">Go from one hard-coded tool to a registry of four that both of your protocols can use, where a failing tool becomes information the model can act on instead of a crash.</p>
+    </header>
+
+    <section>
+      <h2>First: your prediction</h2>
+      <p>
+        In Lesson 2 you predicted what your loop does when <code>list_files</code> gets a path that doesn't exist, and whether
+        the OpenAI protocol reports failures the way Anthropic's does. Recall your answer before opening this.
+      </p>
+      <details class="reveal">
+        <summary>What it should do, on each protocol</summary>
+        <p>
+          It should not crash, and it should not hide the failure. It should send back a normal tool result that says what went wrong.
+          How you mark it as a failure depends on the protocol:
+        </p>
+        <ul>
+          <li><strong>Anthropic Messages (Claude)</strong> has a flag: <code>"is_error": true</code> on the <code>tool_result</code> (<a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls" target="_blank" rel="noopener">Handle tool calls</a>).</li>
+          <li><strong>OpenAI Chat Completions (Ollama, llama.cpp)</strong> has no such flag. A <code>role: "tool"</code> message is just text, so <em>the text is the only signal</em>. OpenCode does the same: on this protocol an error result is simply written out as the message content (<a href="../packages/ai/src/protocols/shared.ts">protocols/shared.ts</a>).</li>
+        </ul>
+        <p>
+          This works on small local models too. On this Mac, both Ollama and llama.cpp running <code>qwen3.5:9b</code> received
+          <code>"Error: directory not found: . (try listing 'src' instead)"</code> and immediately called <code>list_files</code> again with
+          <code>"src"</code>. A clear error message is the whole mechanism, so write it well.
+        </p>
+      </details>
+    </section>
+
+    <section>
+      <h2>A tool is one object</h2>
+      <p>
+        Every serious agent ends up with the same shape. A tool is a single value holding four things:
+        a <strong>name</strong>, a <strong>description</strong>, an <strong>input schema</strong>, and an
+        <strong>executor</strong> (the function that does the work). Compare Thorsten Ball's Go agent with OpenCode:
+      </p>
+      <div class="compare">
+        <figure>
+          <figcaption>Thorsten Ball (Go)</figcaption>
+<pre><code>type ToolDefinition struct {
+  Name        string
+  Description string
+  InputSchema ToolInputSchemaParam
+  Function    func(input json.RawMessage)
+                (string, error)
+}</code></pre>
+        </figure>
+        <figure>
+          <figcaption>OpenCode read tool (TS + Effect)</figcaption>
+<pre><code>editor.add({
+  name,             // "read"
+  description: "Read the contents of…",
+  input: Input,     // Effect Schema
+  output: Output,
+  execute: (input, context) => …,
+})</code></pre>
+        </figure>
+      </div>
+      <p class="where">
+        Sources: <a href="https://ampcode.com/how-to-build-an-agent" target="_blank" rel="noopener">How to Build an Agent</a>;
+        <a href="../packages/core/src/tool/plugin/read.ts">packages/core/src/tool/plugin/read.ts</a>.
+        OpenCode's <a href="../packages/core/src/tool/AGENTS.md">tool/AGENTS.md</a> makes this a rule:
+        "Each tool carries its name, options, schemas, and executable behavior in one object."
+      </p>
+      <p>
+        Notice that neither object mentions a protocol. A tool is provider-neutral. Keeping it that way is what makes tools <em>data</em>:
+      </p>
+      <ol class="step-list">
+        <li><strong>Each protocol's tool list is derived from the registry.</strong> One small function turns a tool into <code>{ type: "function", function: { name, description, parameters } }</code> for OpenAI; another turns it into <code>{ name, description, input_schema }</code> for Anthropic. Same JSON Schema, different wrapping. You never write a definition twice.</li>
+        <li><strong>Dispatch is a lookup by name.</strong> When a tool call arrives, find the tool with that name and run its executor. A tool the model asks for that you don't have isn't a crash either: Ball's agent replies <code>"tool not found"</code> as an error result.</li>
+      </ol>
+      <p>
+        Add a fifth tool and you add one object. Neither loop changes, and neither does any protocol code. That's the tangible win of this lesson.
+      </p>
+    </section>
+
+    <section>
+      <h2>Three rules for tools the model can use well</h2>
+
+      <h3>1. Descriptions matter most</h3>
+      <p>
+        Claude's docs call detailed descriptions
+        <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools" target="_blank" rel="noopener">"by far the most important factor in tool performance"</a>
+        and recommend at least 3–4 sentences: what the tool does, when to use it (and when not to), what each
+        parameter means, and its limits. OpenCode's <code>read</code> description is seven sentences long, and it
+        tells the model how to read large files ("Use offset and limit…") and when to use a different tool
+        ("use grep to find specific content"). Anthropic's tool-design post gives a useful test: describe the
+        tool <a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">as you would to a new hire</a>.
+        The advice comes from Anthropic, but it matters <em>more</em> for a 9B local model, which has less ability to guess what you meant.
+      </p>
+
+      <h3>2. Errors should say what to do next</h3>
+      <p>
+        The docs: "Instead of generic errors such as <code>"failed"</code>, include what went wrong and what Claude
+        should try next." Here is OpenCode doing it. When a file is missing, the <code>read</code> tool doesn't
+        return "not found". It looks for similar names:
+      </p>
+<pre><code>File not found: docs/README
+
+Did you mean one of these?
+docs/README.md</code></pre>
+      <p>
+        Its truncation notice works the same way: <code>[Output truncated. Continue reading with offset: 2001]</code>.
+        The model gets the exact next call to make. On your local providers, where there's no error flag, this text is everything.
+      </p>
+
+      <h3>3. Model input is untrusted</h3>
+      <p>
+        The schema tells the model what to send, but nothing forces it to comply. Claude's docs say that when input
+        is invalid and you reply with an error result, "Claude will retry 2–3 times with corrections before apologizing to the user."
+        Local models make this mistake more often, and the OpenAI protocol adds one more way to fail: <code>arguments</code> arrives as a
+        JSON <em>string</em>, so <code>JSON.parse</code> itself can throw on a malformed reply. Treat a parse failure like any other bad
+        input: an instructive error result, never a crash. OpenCode's registry validates model input at runtime for every tool
+        (<a href="../packages/core/src/tool/AGENTS.md">tool/AGENTS.md</a>, Registration). In the Effect lesson,
+        <code>Schema</code> will do this for you. For now, check it by hand.
+      </p>
+    </section>
+
+    <section>
+      <h2>Tools on each provider</h2>
+
+      <h3>Ollama and llama.cpp (OpenAI protocol)</h3>
+      <table>
+        <tr><th>What</th><th>Shape</th></tr>
+        <tr><td>Definition</td><td><code>{ type: "function", function: { name, description, parameters } }</code></td></tr>
+        <tr><td>Call</td><td><code>message.tool_calls[i]</code>: <code>id</code>, <code>function.name</code>, <code>function.arguments</code> (JSON string)</td></tr>
+        <tr><td>Result</td><td><code>{ role: "tool", tool_call_id, content }</code>, one message per call</td></tr>
+        <tr><td>Failure</td><td>No flag. Start the content with <code>Error:</code> and say what to try next.</td></tr>
+      </table>
+      <ul>
+        <li><strong>Keep the tool list short.</strong> Every definition costs context on every step, and a 32k window is small. Anthropic's tool-design advice ("more tools don't always lead to better outcomes") applies doubly here.</li>
+        <li><strong>llama.cpp picks a tool-call format from the model's chat template.</strong> When it doesn't recognize the template it falls back to a generic format that "may consume more tokens and be less efficient" (<a href="https://github.com/ggml-org/llama.cpp/blob/master/docs/function-calling.md" target="_blank" rel="noopener">function-calling.md</a>). If tool calls misbehave on llama.cpp but not Ollama, check the chat format in the server's startup log.</li>
+        <li><strong>Ollama's OpenAI endpoint doesn't support <code>tool_choice</code></strong>, so you can't force a tool call there (<a href="https://docs.ollama.com/api/openai-compatibility" target="_blank" rel="noopener">OpenAI compatibility</a>). Steer with the prompt and descriptions instead.</li>
+      </ul>
+
+      <h3>Claude (Anthropic protocol)</h3>
+      <table>
+        <tr><th>What</th><th>Shape</th></tr>
+        <tr><td>Definition</td><td><code>{ name, description, input_schema }</code></td></tr>
+        <tr><td>Call</td><td><code>content[i]</code> with <code>type: "tool_use"</code>: <code>id</code>, <code>name</code>, <code>input</code> (an object)</td></tr>
+        <tr><td>Result</td><td>One user message whose content starts with every <code>tool_result</code> block: <code>tool_use_id</code>, <code>content</code></td></tr>
+        <tr><td>Failure</td><td><code>is_error: true</code>, plus the same instructive text</td></tr>
+      </table>
+      <p>
+        Two Claude-only extras: <code>strict: true</code> on a tool definition makes Claude's calls always match your schema
+        (<a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools" target="_blank" rel="noopener">Define tools</a>), and
+        Claude is your reference. When a local model keeps calling a tool wrong, run the same prompt and tools against Claude. If Claude gets it right,
+        improve the description or accept the model's limit. If Claude gets it wrong too, the problem is probably your definition or your dispatch.
+      </p>
+    </section>
+
+    <section>
+      <h2>Check yourself</h2>
+
+      <div class="quiz">
+        <p class="quiz-question"><code>list_files</code> is called with a path that doesn't exist. What should your executor produce?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">Throw the error and let the program exit</button>
+          <button class="quiz-option" data-correct="false">Return an empty listing so the loop continues</button>
+          <button class="quiz-option" data-correct="true">Return an error result saying what to try</button>
+          <button class="quiz-option" data-correct="false">Retry the tool silently until it finally works</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. An honest, instructive error result lets the model recover, on any provider." data-wrong-text="Not quite. A crash ends the conversation and an empty result is a lie. Return an error result the model can act on." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">On the OpenAI protocol (Ollama, llama.cpp), how does the model learn that a tool failed?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">From the is_error flag set on the result</button>
+          <button class="quiz-option" data-correct="true">Only from the text of the tool message</button>
+          <button class="quiz-option" data-correct="false">From the HTTP status code of the request</button>
+          <button class="quiz-option" data-correct="false">From a separate error role in the history</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. No flag exists on this protocol, so the message text has to make the failure obvious." data-wrong-text="Only the text. is_error belongs to Anthropic's protocol; a role &quot;tool&quot; message has nothing but content." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">The model calls <code>delete_everything</code>, a tool you never defined. What does your loop do?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="true">Reply with an error result naming the tool</button>
+          <button class="quiz-option" data-correct="false">Crash, because the model broke the API contract</button>
+          <button class="quiz-option" data-correct="false">Skip it and send the next user prompt</button>
+          <button class="quiz-option" data-correct="false">Run the closest matching tool name you have</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. Every tool call still needs a result, even a failed one." data-wrong-text="Not quite. Every tool call needs a matching result. For an unknown tool, that's an error result, as in Ball's &quot;tool not found&quot;." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">According to Claude's docs, which part of a tool definition matters most for performance?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">Its name</button>
+          <button class="quiz-option" data-correct="false">Its schema</button>
+          <button class="quiz-option" data-correct="true">Its description</button>
+          <button class="quiz-option" data-correct="false">Its executor</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. &quot;By far the most important factor in tool performance.&quot;" data-wrong-text="It's the description: &quot;by far the most important factor in tool performance,&quot; at least 3–4 sentences." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">In OpenCode, what does the model receive when <code>read</code> can't find a file?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">A crash report with a full stack trace</button>
+          <button class="quiz-option" data-correct="false">An empty file so the step keeps going</button>
+          <button class="quiz-option" data-correct="false">Nothing at all, since OpenCode retries the read</button>
+          <button class="quiz-option" data-correct="true">A failure listing similar filenames it could try</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. &quot;Did you mean one of these?&quot; turns a dead end into a next step." data-wrong-text="It returns a failure with suggestions: &quot;File not found: … Did you mean one of these?&quot;" hidden></p>
+      </div>
+
+      <p>From Lesson 2: a tool object spans two of the three parts. Which part does each piece belong to?</p>
+
+      <div class="quiz">
+        <p class="quiz-question">Finding which executor handles a tool call, by name.</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">Session</button>
+          <button class="quiz-option" data-correct="true">Harness</button>
+          <button class="quiz-option" data-correct="false">Sandbox</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. Routing tool calls is the harness's job." data-wrong-text="It's the harness: the loop that routes each tool call to a tool." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">The <code>bash</code> executor actually spawning a shell process.</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">Session</button>
+          <button class="quiz-option" data-correct="false">Harness</button>
+          <button class="quiz-option" data-correct="true">Sandbox</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. The definition and dispatch are harness; the work happens in the sandbox. That's why permissions (Stage C) attach to execution." data-wrong-text="It's the sandbox: the place where tools touch the world. Definitions and dispatch are harness; execution is sandbox." hidden></p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Your turn: build the registry</h2>
+      <p>In your agent repo, on Ollama first. Still plain TypeScript and <code>fetch</code>; Effect comes after the provider lesson.</p>
+      <ol class="step-list">
+        <li>
+          Define the provider-neutral shape once:
+<pre><code>type Tool = {
+  name: string
+  description: string
+  parameters: Record&lt;string, unknown&gt; // JSON Schema, shared by both protocols
+  execute: (input: unknown) => Promise&lt;string&gt;
+}</code></pre>
+          Make <code>list_files</code> the first value of this type, and keep a <code>const tools: Tool[]</code>.
+        </li>
+        <li>Write <code>toOpenAITool(tool)</code> and use it with <code>map</code> to build the <code>tools</code> parameter for Ollama and llama.cpp.</li>
+        <li>
+          Write one <code>runTool(name, rawArguments)</code> that returns <code>{ content: string, isError: boolean }</code>. It looks the tool up,
+          parses the arguments (a JSON string on OpenAI), and catches <em>everything</em>: unknown tool, bad JSON, bad input, a throwing executor.
+          Your OpenAI loop sends <code>content</code> in the <code>role: "tool"</code> message, starting it with <code>Error:</code> when <code>isError</code> is true.
+        </li>
+        <li>
+          Add <code>read_file</code>, <code>write_file</code>, and <code>bash</code>. Give each a description of
+          at least three sentences. Check inputs by hand inside each <code>execute</code> (for example, throw
+          <code>"path must be a string, e.g. src/index.ts"</code>).
+        </li>
+        <li>
+          Put a y/n confirmation in front of <code>bash</code> and <code>write_file</code> before running them
+          (Lesson 2's safety note). If the user answers no, return an error result with
+          <code>"User declined"</code>. That's a small preview of Stage C.
+        </li>
+        <li>
+          <strong>Prove it works:</strong> ask the agent to read a file that doesn't exist. You should
+          see the error go out and the model react to it (try another path, or explain the problem)
+          instead of the program crashing. Then run the same prompt with <code>BASE_URL</code> pointed at llama.cpp.
+        </li>
+        <li>
+          <strong>Claude (optional):</strong> write <code>toAnthropicTool(tool)</code>, reuse the same <code>runTool</code>, and in your Claude loop map
+          <code>isError</code> to <code>is_error</code>. Notice what you wrote twice: the loop, and the translation in and out. That's Lesson 4's job.
+        </li>
+      </ol>
+      <div class="callout">
+        <span class="callout-label">Watch for this</span>
+        With four tools, a model may request several tools in one reply. Every call needs its own result.
+        On the OpenAI protocol that's one <code>role: "tool"</code> message per call, right after the assistant message.
+        On Anthropic it's one user message whose content <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls" target="_blank" rel="noopener">starts with all the <code>tool_result</code> blocks</a>.
+        A 400 error mentioning "tool_use ids were found without tool_result blocks" means you got this wrong.
+      </div>
+      <div class="callout">
+        <span class="callout-label">If you have 32 GB or more (your M4)</span>
+        A larger local model will make fewer malformed calls. Try it as a free second reference before reaching for Claude, but keep
+        building against <code>qwen3.5:9b</code>: code that handles a small model's mistakes handles everyone's.
+      </div>
+      <div class="callout">
+        <span class="callout-label">Tangible win</span>
+        Adding a tool now means adding one object, and it works on every provider at once. Your tools no longer depend on your loops,
+        and that independence is what lets OpenCode accept tools from plugins and MCP servers it has never seen.
+      </div>
+    </section>
+
+    <section>
+      <h2>Primary source for this lesson</h2>
+      <p>
+        Anthropic Engineering, <a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">"Writing effective tools for agents — with agents"</a>.
+        After building your four tools, read it and rewrite one description using its "new hire" test. Then measure:
+        does <code>qwen3.5:9b</code> call the tool correctly more often with the new description?
+      </p>
+    </section>
+
+    <p class="ask-claude">
+      Stuck on a 400 error, unsure whether a description is good enough, or watching a local model call a tool wrong in a loop?
+      Ask your teaching session. Paste the actual error, the request, and which provider you were on.
+    </p>
+
+    <ul class="sources">
+      <li>Source: <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls" target="_blank" rel="noopener">Claude docs: Handle tool calls</a> (is_error, ordering, retries)</li>
+      <li>Source: <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools" target="_blank" rel="noopener">Claude docs: Define tools</a> (descriptions, strict)</li>
+      <li>Source: <a href="https://www.anthropic.com/engineering/writing-tools-for-agents" target="_blank" rel="noopener">Anthropic Engineering: Writing effective tools for agents</a></li>
+      <li>Source: <a href="https://docs.ollama.com/api/openai-compatibility" target="_blank" rel="noopener">Ollama docs: OpenAI compatibility</a></li>
+      <li>Source: <a href="https://github.com/ggml-org/llama.cpp/blob/master/docs/function-calling.md" target="_blank" rel="noopener">llama.cpp: function-calling.md</a></li>
+      <li>Source: <a href="https://ampcode.com/how-to-build-an-agent" target="_blank" rel="noopener">Thorsten Ball: How to Build an Agent</a> (ToolDefinition, "tool not found")</li>
+      <li>Source: this repo's <a href="../packages/core/src/tool/plugin/read.ts">tool/plugin/read.ts</a>, <a href="../packages/core/src/tool/AGENTS.md">tool/AGENTS.md</a>, <a href="../packages/ai/src/protocols/shared.ts">ai/src/protocols/shared.ts</a></li>
+      <li>Measured: error-result round trips on Ollama 0.40.13 and llama.cpp b11669 with qwen3.5:9b (2026-10-31).</li>
+    </ul>
+  </main>
+  <script src="../assets/quiz.js"></script>
+</body>
+</html>
