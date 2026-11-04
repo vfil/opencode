@@ -9,9 +9,9 @@
 <body>
   <main class="reference">
     <nav class="nav-links">
-      <a href="../lessons/0003-tools-as-data.html">Lesson 3: Tools as Data</a>
+      <a href="../lessons/0003-tools-as-data.html">Part 3: Tools as Data</a>
       <a href="agent-architecture.html">Reference: Agent architecture</a>
-      <a href="../GLOSSARY.md">Glossary</a>
+      <a href="glossary.html">Glossary</a>
     </nav>
 
     <h1>Tool Design</h1>
@@ -25,7 +25,7 @@
   execute: (input: unknown) => Promise&lt;string&gt; // validates its own input
 }
 
-const tools: Tool[] = [listFiles, readFile, writeFile, bash]
+const tools: Tool[] = [listFiles, readFile, editFile, writeFile, bash]
 
 // Each protocol's definitions are derived, never written twice
 const toOpenAITool = (t: Tool) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } })
@@ -62,7 +62,7 @@ const toAnthropicTool = (t: Tool) => ({ name: t.name, description: t.description
       <tr>
         <td>One object per tool: name, description, schema, executor. No protocol inside.</td>
         <td>Adding a tool never touches a loop or a protocol.</td>
-        <td><a href="../packages/core/src/tool/AGENTS.md">tool/AGENTS.md</a></td>
+        <td><a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/tool/AGENTS.md" target="_blank" rel="noopener">tool/AGENTS.md</a></td>
       </tr>
       <tr>
         <td>Failures are results, never a crash.</td>
@@ -72,7 +72,7 @@ const toAnthropicTool = (t: Tool) => ({ name: t.name, description: t.description
       <tr>
         <td>Errors say what went wrong <em>and what to try next</em>.</td>
         <td>On the OpenAI protocol the text is the only signal. qwen3.5:9b followed "try 'src' instead" on both local providers.</td>
-        <td><a href="../packages/core/src/tool/plugin/read.ts">read.ts</a>, <a href="../packages/ai/src/protocols/shared.ts">shared.ts</a></td>
+        <td><a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/tool/plugin/read.ts" target="_blank" rel="noopener">read.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/ai/src/protocols/shared.ts" target="_blank" rel="noopener">shared.ts</a></td>
       </tr>
       <tr>
         <td>Descriptions: what, when (and when not), each parameter, limits.</td>
@@ -92,7 +92,7 @@ const toAnthropicTool = (t: Tool) => ({ name: t.name, description: t.description
     </table>
 
     <h2>Where a tool lives</h2>
-    <p>Definition and dispatch are <strong>harness</strong>. Execution is <strong>sandbox</strong>, which is why permissions attach to execution, not to the registry (<a href="../packages/core/src/tool/AGENTS.md">tool/AGENTS.md</a>, Permissions).</p>
+    <p>Definition and dispatch are <strong>harness</strong>. Execution is <strong>sandbox</strong>, which is why permissions attach to execution, not to the registry (<a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/tool/AGENTS.md" target="_blank" rel="noopener">tool/AGENTS.md</a>, Permissions).</p>
   </main>
 </body>
 </html>

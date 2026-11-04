@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Glossary</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <main class="reference">
+    <nav class="nav-links">
+      <a href="../lessons/0001-the-agent-loop.html">Part 1: The Agent Loop</a>
+      <a href="agent-architecture.html">Reference: Agent architecture</a>
+      <a href="tool-design.html">Reference: Tool design</a>
+    </nav>
+
+    <h1>Coding an AI Agent Glossary</h1>
+    <p>The vocabulary for building a coding agent that runs against several model sources. Terms follow OpenCode's own usage so its source reads without translation.</p>
+    <h2>Models and providers</h2>
+    <h3>Provider</h3>
+    <p>A service that serves models over HTTP, such as Ollama, a llama.cpp server, or Anthropic.</p>
+    <p class="where">Avoid: Backend, API, runtime, vendor</p>
+    <h3>Protocol</h3>
+    <p>The wire format of one request and its response, such as Ollama's native format, OpenAI Chat Completions, or Anthropic Messages. One provider can speak several protocols, and several providers can share one.</p>
+    <p class="where">Avoid: API, SDK, format</p>
+    <h3>Route</h3>
+    <p>A protocol bound to one provider's endpoint and authentication. Ollama and a llama.cpp server share a protocol but have different routes.</p>
+    <p class="where">Avoid: Adapter, connector, driver</p>
+    <h3>Model</h3>
+    <p>A specific set of weights a provider serves, such as <code>qwen3.5:9b</code> or a Claude model.</p>
+    <p class="where">Avoid: Provider, engine</p>
+    <h2>Tools</h2>
+    <h3>Tool</h3>
+    <p>A named capability the model may request, defined by a name, a description, an input JSON Schema and an executor.</p>
+    <p class="where">Avoid: Function, plugin, skill</p>
+    <h3>Tool registry</h3>
+    <p>The collection of tools an agent knows, from which each tool call is matched to a tool by name.</p>
+    <p class="where">Avoid: Tool list, tool map, toolbox</p>
+    <h3>Tool call</h3>
+    <p>The model's structured request to run one tool with given arguments.</p>
+    <p class="where">Avoid: Function call, tool use</p>
+    <h3>Tool result</h3>
+    <p>What your code sends back for one tool call, including a failure written out as text.</p>
+    <p class="where">Avoid: Tool output, response</p>
+    <h2>The loop</h2>
+    <h3>Step</h3>
+    <p>Exactly one model call, from request to response.</p>
+    <p class="where">Avoid: Turn, iteration, provider turn</p>
+    <h3>Turn</h3>
+    <p>All the steps from a user prompt until the agent goes idle.</p>
+    <p class="where">Avoid: Step, round</p>
+  </main>
+</body>
+</html>

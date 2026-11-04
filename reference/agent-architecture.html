@@ -9,10 +9,10 @@
 <body>
   <main class="reference">
     <nav class="nav-links">
-      <a href="../lessons/0001-the-agent-loop.html">Lesson 1: The Agent Loop</a>
-      <a href="../lessons/0002-the-roadmap.html">Lesson 2: The Roadmap</a>
+      <a href="../lessons/0001-the-agent-loop.html">Part 1: The Agent Loop</a>
+      <a href="../lessons/0002-the-roadmap.html">Part 2: The Roadmap</a>
       <a href="tool-design.html">Reference: Tool design</a>
-      <a href="../GLOSSARY.md">Glossary</a>
+      <a href="glossary.html">Glossary</a>
     </nav>
 
     <h1>Agent Architecture</h1>
@@ -38,14 +38,13 @@
       <tr><td><strong>Turn</strong></td><td>All steps from a user prompt until the agent goes idle.</td><td>Your whole <code>while</code> loop, once</td></tr>
     </table>
 
-    <h2>Routes in this course</h2>
+    <h2>Routes in this series</h2>
     <table>
       <tr><th>Provider</th><th>Protocol</th><th>Endpoint</th><th>Start</th></tr>
       <tr><td>Ollama 0.40.13</td><td>OpenAI Chat Completions</td><td><code>http://127.0.0.1:11434/v1/chat/completions</code></td><td><code>OLLAMA_CONTEXT_LENGTH=32768 ollama serve</code></td></tr>
       <tr><td>llama.cpp b11669</td><td>OpenAI Chat Completions</td><td><code>http://127.0.0.1:9931/v1/chat/completions</code></td><td><code>llama-server -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M --no-mmproj -c 32768 --port 9931</code></td></tr>
       <tr><td>Anthropic</td><td>Anthropic Messages</td><td><code>https://api.anthropic.com/v1/messages</code></td><td>Headers <code>x-api-key</code>, <code>anthropic-version: 2023-06-01</code></td></tr>
     </table>
-    <p class="where">Why two protocols: <a href="../docs/adr/0001-two-protocols-for-three-providers.md">ADR 0001</a>.</p>
 
     <h2>Wire shapes</h2>
     <table>
@@ -61,7 +60,7 @@
       Sources: <a href="https://docs.ollama.com/capabilities/tool-calling" target="_blank" rel="noopener">Ollama tool calling</a>,
       <a href="https://github.com/ggml-org/llama.cpp/blob/master/docs/function-calling.md" target="_blank" rel="noopener">llama.cpp function calling</a>,
       <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls" target="_blank" rel="noopener">Claude: Handle tool calls</a>.
-      OpenAI-protocol shapes measured on this Mac, 2026-10-31.
+      OpenAI-protocol shapes measured with Ollama 0.40.13 and llama.cpp b11669 on a MacBook with an Apple M1 and 16 GB of memory, 2026-10-31.
     </p>
 
     <h2>The three parts</h2>
@@ -96,7 +95,7 @@
       <li>Ollama defaults to a 4k context on small machines. Agents need 32k or more; set it explicitly.</li>
       <li>Claude is the reference: if Claude succeeds where a local model fails, the model is weak; if both fail, suspect the harness.</li>
       <li>Each step is one model call that continues from <em>reloaded</em> history. No in-memory tool loop (OpenCode).</li>
-      <li>This repo uses Effect <strong>v4</strong>; check the <a href="https://github.com/Effect-TS/effect/blob/main/MIGRATION.md" target="_blank" rel="noopener">migration guide</a> when v3 examples don't fit.</li>
+      <li>OpenCode uses Effect <strong>v4</strong>; check the <a href="https://github.com/Effect-TS/effect/blob/main/MIGRATION.md" target="_blank" rel="noopener">migration guide</a> when v3 examples don't fit.</li>
     </ul>
   </main>
 </body>
