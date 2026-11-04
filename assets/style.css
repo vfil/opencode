@@ -94,6 +94,19 @@ h3 {
   margin-top: 1.8rem;
 }
 
+h4 {
+  font-size: 1rem;
+  margin: 2.2rem 0 0.4rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid var(--rule);
+}
+
+/* Transcript: what a run of the program prints, marked apart from code you type. */
+pre.transcript {
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+}
+
 p {
   margin: 1rem 0;
 }

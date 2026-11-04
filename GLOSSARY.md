@@ -20,6 +20,24 @@ _Avoid_: Adapter, connector, driver
 A specific set of weights a provider serves, such as `qwen3.5:9b` or a Claude model.
 _Avoid_: Provider, engine
 
+## Tools
+
+**Tool**:
+A named capability the model may request, defined by a name, a description, an input JSON Schema and an executor.
+_Avoid_: Function, plugin, skill
+
+**Tool registry**:
+The collection of tools an agent knows, from which each tool call is matched to a tool by name.
+_Avoid_: Tool list, tool map, toolbox
+
+**Tool call**:
+The model's structured request to run one tool with given arguments.
+_Avoid_: Function call, tool use
+
+**Tool result**:
+What your code sends back for one tool call, including a failure written out as text.
+_Avoid_: Tool output, response
+
 ## The loop
 
 **Step**:
