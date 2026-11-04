@@ -3,52 +3,50 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Lesson 2: The Roadmap</title>
+  <title>Part 2: The Roadmap</title>
   <link rel="stylesheet" href="../assets/style.css" />
 </head>
 <body>
   <main class="lesson">
     <nav class="nav-links">
-      <a href="0001-the-agent-loop.html">← Lesson 1: The Agent Loop</a>
-      <a href="0003-tools-as-data.html">Next: Lesson 3, Tools as Data →</a>
+      <a href="0001-the-agent-loop.html">← Part 1: The Agent Loop</a>
+      <a href="0003-tools-as-data.html">Next: Part 3, Tools as Data →</a>
       <a href="../reference/agent-architecture.html">Reference: Agent architecture</a>
-      <a href="../GLOSSARY.md">Glossary</a>
+      <a href="../reference/glossary.html">Glossary</a>
     </nav>
 
     <header>
-      <p class="lesson-kicker">Lesson 2 of the mini-OpenCode mission</p>
+      <p class="lesson-kicker">Coding an AI Agent · Part 2</p>
       <h1>The Roadmap</h1>
-      <p class="subtitle">Your Lesson 1 loop works, and breaks in five specific ways. Each part of this course fixes one of them. Here's the order, and why.</p>
+      <p class="subtitle">The Part 1 agent works and has five specific weaknesses. Each part of this series addresses one of them. This post gives the order and the reasoning.</p>
     </header>
 
     <section>
       <h2>Start from what breaks</h2>
       <p>
-        The loop you're building in your separate repo is a real agent. It's also fragile. Before
-        reading the map, notice the five ways it will fail you:
+        The loop built in Part 1 is a real agent, and it has limits. Before the map, here are the five ways it fails:
       </p>
       <ol class="step-list">
-        <li><strong>It can barely do anything.</strong> One tool. If that tool throws, the whole program probably crashes instead of telling the model what went wrong.</li>
+        <li><strong>Its capabilities are limited.</strong> Three tools: <code>list_files</code>, <code>read_file</code> and <code>edit_file</code>. If one of them throws, for example on a path that doesn't exist, the program crashes instead of telling the model what went wrong.</li>
         <li><strong>You can't test it.</strong> Every run needs a live model: seconds per step locally, money per step on Claude, and a different answer each time. Errors are invisible in the types: nothing tells you <code>list_files</code> can fail.</li>
         <li><strong>It forgets everything.</strong> Your <code>messages</code> array lives in memory. Press <code>Ctrl-C</code> and the conversation is gone.</li>
-        <li><strong>It does whatever it's told.</strong> Add a <code>bash</code> tool and the model can run any command it proposes. Nothing stands between the proposal and the execution.</li>
+        <li><strong>It has no guardrails.</strong> Add a <code>bash</code> tool and the model can run any command it proposes. Nothing stands between the proposal and the execution.</li>
         <li><strong>It speaks one protocol per file.</strong> Your local loop and your Claude loop are two near-copies. Every fix has to be made twice, and a fourth provider would mean a third copy.</li>
       </ol>
       <p>
-        Every module ahead exists because of one of these. If a topic ever feels like unmotivated complexity,
-        trace it back to this list.
+        Each module ahead addresses one of these. When a topic seems unmotivated, this list gives the reason it is there.
       </p>
     </section>
 
     <section>
-      <h2>Three parts of every serious agent</h2>
+      <h2>Three parts of an agent</h2>
       <p>
         You already met this framing in Anthropic's
         <a href="https://www.anthropic.com/research/managed-agents" target="_blank" rel="noopener">Managed Agents post</a>.
-        It's the backbone of the roadmap, so here it is precisely:
+        This framing is the basis of the roadmap:
       </p>
       <ul>
-        <li><strong>Harness</strong>: the loop. Calls the model, reads its tool calls, routes each one to the right tool. Your Lesson 1 code is a harness.</li>
+        <li><strong>Harness</strong>: the loop. Calls the model, reads its tool calls, routes each one to the right tool. Your Part 1 code is a harness.</li>
         <li><strong>Session</strong>: the durable record of what happened, stored outside the model's context window and outside your process, so it survives crashes.</li>
         <li><strong>Sandbox</strong>: where tools actually touch the world (files, shell), with guardrails on what's allowed.</li>
       </ul>
@@ -62,20 +60,19 @@
     <section>
       <h2>The vocabulary</h2>
       <p>
-        OpenCode is strict about vocabulary, and you should be too, because it'll be in every file you read.
-        The <a href="../GLOSSARY.md">glossary</a> is the canonical list; these are the six words the map uses:
+        OpenCode uses its vocabulary consistently, and the same terms appear in every file of its source.
+        The <a href="../reference/glossary.html">glossary</a> is the canonical list; these are the six words the map uses:
       </p>
       <ul>
         <li>A <strong>provider</strong> serves models over HTTP (Ollama, a llama.cpp server, Anthropic). A <strong>model</strong> is specific weights (<code>qwen3.5:9b</code>).</li>
-        <li>A <strong>protocol</strong> is a wire format (OpenAI Chat Completions, Anthropic Messages). A <strong>route</strong> binds a protocol to one provider's endpoint and auth. Ollama and llama.cpp are two routes on one protocol; that's exactly OpenCode's <code>Route.make</code> (<a href="../packages/ai/src/route/protocol.ts">route/protocol.ts</a>).</li>
-        <li>A <strong>step</strong> is exactly one model call, from request to response. Your loop's body, once (per <a href="../AGENTS.md">AGENTS.md</a>).</li>
-        <li>A <strong>turn</strong> is all the steps from a user prompt until the agent goes idle. Lesson 1's "the loop stops when the model replies with text" is the end of a turn.</li>
+        <li>A <strong>protocol</strong> is a wire format (OpenAI Chat Completions, Anthropic Messages). A <strong>route</strong> binds a protocol to one provider's endpoint and auth. Ollama and llama.cpp are two routes on one protocol; which matches OpenCode's <code>Route.make</code> (<a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/ai/src/route/protocol.ts" target="_blank" rel="noopener">route/protocol.ts</a>).</li>
+        <li>A <strong>step</strong> is exactly one model call, from request to response. Your loop's body, once (per <a href="https://github.com/anomalyco/opencode/blob/863ea41364/AGENTS.md" target="_blank" rel="noopener">AGENTS.md</a>).</li>
+        <li>A <strong>turn</strong> is all the steps from a user prompt until the agent goes idle. Part 1's "the loop stops when the model replies with text" is the end of a turn.</li>
       </ul>
       <p>
-        One rule from the same file will reshape your clone in Stage B: <em>"Each step is one explicit
+        One rule from the same file will reshape your agent in Stage B: <em>"Each step is one explicit
         <code>llm.stream</code> call that continues from reloaded history. Do not add an in-memory tool loop."</em>
-        Your Lesson 1 loop is exactly the in-memory tool loop that rule forbids. That's fine for now.
-        Understanding <em>why</em> OpenCode forbids it is the point of Stage B.
+        The Part 1 loop is an in-memory tool loop of the kind that rule forbids. It stays as it is until Stage B, which covers <em>why</em> OpenCode forbids it.
       </p>
     </section>
 
@@ -90,21 +87,21 @@
           <div class="module done">
             <h4><a href="0001-the-agent-loop.html">The agent loop</a> <span class="status">done</span></h4>
             <p>Prompt → tool call → run it → tool result → repeat, on Ollama, llama.cpp, and Claude.</p>
-            <p class="milestone">One-tool agent in plain TypeScript (you're building this now).</p>
+            <p class="milestone">Three-tool agent in plain TypeScript: <code>list_files</code>, <code>read_file</code>, <code>edit_file</code>.</p>
           </div>
 
           <div class="module next">
             <h4><a href="0003-tools-as-data.html">Tools as data</a> <span class="status">next</span></h4>
             <p>A tool registry: name, description, input schema, and executor in one object. Tool failures returned to the model as results instead of crashing the loop.</p>
-            <p class="milestone"><code>read_file</code>, <code>write_file</code>, <code>edit_file</code>, <code>bash</code>.</p>
-            <p class="where">In OpenCode: <a href="../packages/core/src/tool.ts">packages/core/src/tool.ts</a>, <a href="../packages/core/src/tool/AGENTS.md">tool/AGENTS.md</a> ("each tool carries its name, options, schemas, and executable behavior in one object").</p>
+            <p class="milestone">Five tools in one registry: <code>list_files</code>, <code>read_file</code>, <code>edit_file</code>, <code>write_file</code>, <code>bash</code>.</p>
+            <p class="where">In OpenCode: <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/tool.ts" target="_blank" rel="noopener">packages/core/src/tool.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/tool/AGENTS.md" target="_blank" rel="noopener">tool/AGENTS.md</a> ("each tool carries its name, options, schemas, and executable behavior in one object").</p>
           </div>
 
           <div class="module">
             <h4>Providers behind one interface</h4>
-            <p>Your clone gets its own message type: a tool call is <code>{ type: "tool-call", id, name, input }</code>, a tool result is <code>{ type: "tool-result", id, name, result }</code>, and an error is a kind of result, not a flag. Each protocol translates to and from it, so the loop stops knowing which provider it talks to.</p>
+            <p>Your agent gets its own message type: a tool call is <code>{ type: "tool-call", id, name, input }</code>, a tool result is <code>{ type: "tool-result", id, name, result }</code>, and an error is a kind of result, not a flag. Each protocol translates to and from it, so the loop stops knowing which provider it talks to.</p>
             <p class="milestone">One loop that runs on Ollama, llama.cpp, or Claude by configuration. Adding a provider means adding a route.</p>
-            <p class="where">In OpenCode: <a href="../packages/ai/src/schema/messages.ts">ai/src/schema/messages.ts</a> (<code>ToolCallPart</code>, <code>ToolResultPart</code>), <a href="../packages/ai/src/protocols/openai-compatible-chat.ts">protocols/openai-compatible-chat.ts</a> (24 lines: one protocol, many routes). Why two protocols: <a href="../docs/adr/0001-two-protocols-for-three-providers.md">ADR 0001</a>.</p>
+            <p class="where">In OpenCode: <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/ai/src/schema/messages.ts" target="_blank" rel="noopener">ai/src/schema/messages.ts</a> (<code>ToolCallPart</code>, <code>ToolResultPart</code>), <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/ai/src/protocols/openai-compatible-chat.ts" target="_blank" rel="noopener">protocols/openai-compatible-chat.ts</a> (24 lines: one protocol, many routes).</p>
           </div>
 
           <div class="module">
@@ -117,14 +114,14 @@
             <h4>Services and layers</h4>
             <p>The model client and tools become services your loop <em>asks for</em> instead of imports. Swapping a real model for a scripted fake becomes a one-line change.</p>
             <p class="milestone">A test that runs your whole loop against a fake model. No API key, no cost.</p>
-            <p class="where">In OpenCode: <code>Tool.Service</code>, <code>Permission.Service</code>; this repo's <a href="../.opencode/skills/effect/SKILL.md">Effect skill</a>.</p>
+            <p class="where">In OpenCode: <code>Tool.Service</code>, <code>Permission.Service</code>; OpenCode's <a href="https://github.com/anomalyco/opencode/blob/863ea41364/.opencode/skills/effect/SKILL.md" target="_blank" rel="noopener">Effect skill</a>.</p>
           </div>
 
           <div class="module">
             <h4>Streaming</h4>
             <p>Text arrives token by token instead of all at once. Effect's <code>Stream</code> carries it. Both protocols stream as server-sent events, but in different event shapes, so each protocol needs its own decoder into your common type. Locally this matters most: at ~8 tokens/s on a 16 GB M1, a non-streaming reply can sit silent for half a minute.</p>
             <p class="milestone">Output appears in your terminal as the model writes it, on every provider.</p>
-            <p class="where">In OpenCode: <a href="../packages/ai/src/llm.ts">packages/ai/src/llm.ts</a>. <code>LLM.stream</code> runs exactly one model call (<a href="../packages/ai/AGENTS.md">ai/AGENTS.md</a>).</p>
+            <p class="where">In OpenCode: <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/ai/src/llm.ts" target="_blank" rel="noopener">packages/ai/src/llm.ts</a>. <code>LLM.stream</code> runs exactly one model call (<a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/ai/AGENTS.md" target="_blank" rel="noopener">ai/AGENTS.md</a>).</p>
           </div>
         </div>
 
@@ -136,21 +133,21 @@
             <h4>The session as an event log</h4>
             <p>Append every fact (prompt received, step finished, tool result) to SQLite. Before each step, reload history from the log instead of trusting an in-memory array. This is the "no in-memory tool loop" rule, made concrete.</p>
             <p class="milestone">Kill your agent mid-task, restart it, watch it continue.</p>
-            <p class="where">In OpenCode: <a href="../packages/core/src/session/runner/step.ts">session/runner/step.ts</a>, <a href="../packages/core/src/session/history.ts">session/history.ts</a>. Tool: <a href="https://bun.com/docs/runtime/sqlite" target="_blank" rel="noopener"><code>bun:sqlite</code></a>.</p>
+            <p class="where">In OpenCode: <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/session/runner/step.ts" target="_blank" rel="noopener">session/runner/step.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/session/history.ts" target="_blank" rel="noopener">session/history.ts</a>. Tool: <a href="https://bun.com/docs/runtime/sqlite" target="_blank" rel="noopener"><code>bun:sqlite</code></a>.</p>
           </div>
 
           <div class="module">
             <h4>Inbox vs. execution</h4>
             <p>Saving a prompt and running the model become two separate acts. A prompt is durable the moment it's accepted, even if the process dies before the model sees it.</p>
             <p class="milestone">A queued prompt survives a crash and runs on restart.</p>
-            <p class="where">In OpenCode: <a href="../packages/core/src/session/inbox.ts">session/inbox.ts</a>, <a href="../packages/core/src/session/execution.ts">session/execution.ts</a>, <a href="../packages/core/src/session/execution/restart.ts">execution/restart.ts</a>.</p>
+            <p class="where">In OpenCode: <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/session/inbox.ts" target="_blank" rel="noopener">session/inbox.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/session/execution.ts" target="_blank" rel="noopener">session/execution.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/session/execution/restart.ts" target="_blank" rel="noopener">execution/restart.ts</a>.</p>
           </div>
 
           <div class="module">
             <h4>Context limits and compaction</h4>
-            <p>Long sessions outgrow the model's context window. Older history gets summarized, while the full log stays in the session. Local models hit this first: Ollama's 4k default overflows within a few steps (which is why Lesson 1 starts at 32k), and even 32k fills in a long task. Claude's much larger window delays the problem; it doesn't remove it.</p>
+            <p>Long sessions outgrow the model's context window. Older history gets summarized, while the full log stays in the session. Local models hit this first: Ollama's 4k default overflows within a few steps (which is why Part 1 starts at 32k), and even 32k fills in a long task. Claude's much larger window delays the problem; it doesn't remove it.</p>
             <p class="milestone">A long session that keeps working instead of erroring.</p>
-            <p class="where">In OpenCode: <a href="../packages/core/src/session/compaction.ts">session/compaction.ts</a>.</p>
+            <p class="where">In OpenCode: <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/session/compaction.ts" target="_blank" rel="noopener">session/compaction.ts</a>.</p>
           </div>
         </div>
 
@@ -162,12 +159,12 @@
             <h4>Permissions</h4>
             <p>Ask before risky tools run. A "no" goes back to the model as a result it can react to, not as a crash.</p>
             <p class="milestone">A y/n prompt before <code>write_file</code> and <code>bash</code>; denials the model adapts to.</p>
-            <p class="where">In OpenCode: <a href="../packages/core/src/permission.ts">packages/core/src/permission.ts</a>; the decline handling described in <a href="../packages/core/src/tool/AGENTS.md">tool/AGENTS.md</a>.</p>
+            <p class="where">In OpenCode: <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/permission.ts" target="_blank" rel="noopener">packages/core/src/permission.ts</a>; the decline handling described in <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/tool/AGENTS.md" target="_blank" rel="noopener">tool/AGENTS.md</a>.</p>
           </div>
 
           <div class="module">
             <h4>Interruption</h4>
-            <p><code>Ctrl-C</code> stops the current step cleanly, without corrupting the session log. Effect's interruption model does the heavy lifting.</p>
+            <p><code>Ctrl-C</code> stops the current step cleanly, without corrupting the session log. Effect's interruption model handles this.</p>
             <p class="milestone">Interrupt mid-tool-call, restart, find a consistent session.</p>
           </div>
         </div>
@@ -176,7 +173,7 @@
           <p class="stage-title">Capstone</p>
           <div class="module">
             <h4>Defend your design</h4>
-            <p>Read OpenCode's session runner end to end and write, in your own words, where your clone agrees, where it's simpler, and what that simplicity costs. This is the last success criterion in your <a href="../MISSION.md">mission</a>.</p>
+            <p>Read OpenCode's session runner end to end and write, in your own words, where your agent agrees, where it's simpler, and what that simplicity costs. This is the final exercise of the series.</p>
           </div>
         </div>
 
@@ -184,34 +181,32 @@
 
       <div class="callout">
         <span class="callout-label">Safety note for right now</span>
-        If you add a <code>bash</code> tool before Stage C, put a crude <code>confirm()</code>-style y/n prompt in front of it on day one.
-        The proper permission system can wait. Letting a model run arbitrary shell commands on your machine shouldn't.
+        If you add a <code>bash</code> tool before Stage C, put a simple <code>confirm()</code>-style y/n prompt in front of it from the start. The full permission system can come later. Running arbitrary shell commands proposed by a model should not wait for it.
       </div>
 
       <div class="callout">
-        <span class="callout-label">Heads-up: Effect v4</span>
+        <span class="callout-label">Note: Effect v4</span>
         OpenCode uses <strong>Effect v4</strong>. Most tutorials, blog posts, and much of the
         <a href="https://effect.website/docs" target="_blank" rel="noopener">docs site</a> show v3, and some APIs were renamed
-        (for example <code>Effect.fork</code> became <code>Effect.forkChild</code>, which you'll see in this repo).
-        When an example doesn't compile, check the official
-        <a href="https://github.com/Effect-TS/effect/blob/main/MIGRATION.md" target="_blank" rel="noopener">v3 → v4 migration guide</a>
-        before assuming you're wrong.
+        (for example <code>Effect.fork</code> became <code>Effect.forkChild</code>, which you'll see in OpenCode's source).
+        When an example doesn't compile, the official
+        <a href="https://github.com/Effect-TS/effect/blob/main/MIGRATION.md" target="_blank" rel="noopener">v3 → v4 migration guide</a> is the first place to check.
       </div>
     </section>
 
     <section>
       <h2>Check yourself</h2>
-      <p>First, two questions from Lesson 1. Answer from memory before clicking. Recalling it is the point.</p>
+      <p>First, two questions from Part 1. Answer from memory before clicking; recalling the answer is the purpose of these questions.</p>
 
       <div class="quiz">
-        <p class="quiz-question">On both protocols your clone uses, what ties a tool's result to its request?</p>
+        <p class="quiz-question">On both protocols your agent uses, what ties a tool's result to its request?</p>
         <div class="quiz-options">
           <button class="quiz-option" data-correct="false">The order the tools appear in your array</button>
           <button class="quiz-option" data-correct="false">The tool name repeated in the next prompt</button>
           <button class="quiz-option" data-correct="true">The id the model attached to its tool call</button>
           <button class="quiz-option" data-correct="false">A timestamp your code attaches to each result</button>
         </div>
-        <p class="quiz-feedback" data-correct-text="Right. tool_call_id on OpenAI, tool_use_id on Anthropic. Ollama's native protocol has no id and matches by tool name, one reason your clone doesn't use it." data-wrong-text="It's the call id: tool_call_id on the OpenAI protocol, tool_use_id on Anthropic. It matters once the model makes several calls in one reply." hidden></p>
+        <p class="quiz-feedback" data-correct-text="Right. tool_call_id on OpenAI, tool_use_id on Anthropic. Ollama's native protocol has no id and matches by tool name, one reason your agent doesn't use it." data-wrong-text="It's the call id: tool_call_id on the OpenAI protocol, tool_use_id on Anthropic. It matters once the model makes several calls in one reply." hidden></p>
       </div>
 
       <div class="quiz">
@@ -254,7 +249,7 @@
           <button class="quiz-option" data-correct="false">Harness</button>
           <button class="quiz-option" data-correct="true">Sandbox</button>
         </div>
-        <p class="quiz-feedback" data-correct-text="Right. The Managed Agents post keeps credentials out of the sandbox for exactly this reason." data-wrong-text="It's the sandbox: the guarded place where tools touch the world, with no credentials inside it." hidden></p>
+        <p class="quiz-feedback" data-correct-text="Right. The Managed Agents post keeps credentials out of the sandbox for this reason." data-wrong-text="It's the sandbox: the guarded place where tools touch the world, with no credentials inside it." hidden></p>
       </div>
 
       <div class="quiz">
@@ -303,8 +298,8 @@
     <section>
       <h2>While you build: three predictions</h2>
       <p>
-        Write your answers in a <code>NOTES.md</code> in your agent repo <em>before</em> you get to the matching
-        module. Guessing first, even wrong, makes the real answer stick far better than reading it cold.
+        Write your answers in a notes file next to your agent <em>before</em> you get to the matching
+        module. Making a guess first, even a wrong one, helps retention more than reading the answer directly.
       </p>
       <div class="prompt-box">
         <ol>
@@ -314,14 +309,14 @@
         </ol>
       </div>
       <div class="callout">
-        <span class="callout-label">Tangible win</span>
-        You can now look at any piece of agent code, in your clone or in OpenCode, and say which of the three parts it belongs to
-        and which failure it prevents. That's the lens every remaining lesson uses.
+        <span class="callout-label">Result</span>
+        You can now look at any piece of agent code, in your agent or in OpenCode, and say which of the three parts it belongs to
+        and which failure it prevents. This framing is used in every remaining part.
       </div>
     </section>
 
     <section>
-      <h2>Primary source for this lesson</h2>
+      <h2>Primary source for this post</h2>
       <p>
         Read Anthropic's <a href="https://www.anthropic.com/research/managed-agents" target="_blank" rel="noopener">"Scaling Managed Agents: Decoupling the brain from the hands"</a>
         end to end. With this map in hand, look for where each stage of your roadmap shows up in their design.
@@ -329,9 +324,9 @@
     </section>
 
     <p class="ask-claude">
-      Questions about the order, or want to swap a module earlier (say, permissions before Effect)? Ask your teaching
-      session. The map is a plan, not a contract. Bring your three predictions back too, and we'll check them against what
-      OpenCode actually does.
+      Want to swap a module earlier (say, permissions before Effect)? The map is a plan, not a contract, and the parts are
+      independent enough to reorder. Keep your three predictions handy and check them against what OpenCode actually does as you
+      read the next parts.
     </p>
 
     <ul class="sources">
@@ -339,9 +334,8 @@
       <li>Source: <a href="https://effect.website/docs/getting-started/why-effect/" target="_blank" rel="noopener">Effect docs: Why Effect?</a></li>
       <li>Source: <a href="https://github.com/Effect-TS/effect/blob/main/MIGRATION.md" target="_blank" rel="noopener">Effect v3 → v4 migration guide</a></li>
       <li>Source: <a href="https://bun.com/docs/runtime/sqlite" target="_blank" rel="noopener">Bun docs: SQLite</a></li>
-      <li>Source: this repo's <a href="../AGENTS.md">AGENTS.md</a> (Session Core section)</li>
-      <li>Source: this repo's <a href="../packages/ai/src/route/protocol.ts">ai/src/route/protocol.ts</a> and <a href="../packages/ai/src/schema/messages.ts">ai/src/schema/messages.ts</a></li>
-      <li>Decision record: <a href="../docs/adr/0001-two-protocols-for-three-providers.md">ADR 0001: Two protocols for three providers</a></li>
+      <li>Source: OpenCode's <a href="https://github.com/anomalyco/opencode/blob/863ea41364/AGENTS.md" target="_blank" rel="noopener">AGENTS.md</a> (Session Core section)</li>
+      <li>Source: OpenCode's <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/ai/src/route/protocol.ts" target="_blank" rel="noopener">ai/src/route/protocol.ts</a> and <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/ai/src/schema/messages.ts" target="_blank" rel="noopener">ai/src/schema/messages.ts</a></li>
     </ul>
   </main>
   <script src="../assets/quiz.js"></script>

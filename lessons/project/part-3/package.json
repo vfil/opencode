@@ -1,0 +1,18 @@
+{
+  "name": "my-agent",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "cd playground && bun ../index.ts",
+    "claude": "cd playground && bun ../claude.ts",
+    "typecheck": "tsc --noEmit",
+    "reset": "sh reset-playground.sh"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  }
+}
