@@ -1,0 +1,19 @@
+{
+  "name": "my-agent",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "cd playground && bun ../index.ts",
+    "start:llamacpp": "cd playground && PROVIDER=llamacpp bun ../index.ts",
+    "start:claude": "cd playground && PROVIDER=claude bun ../index.ts",
+    "typecheck": "tsc --noEmit",
+    "reset": "sh reset-playground.sh"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  }
+}
