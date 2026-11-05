@@ -1,0 +1,2338 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Part 5: Why Effect</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <main class="lesson">
+    <nav class="nav-links">
+      <a href="0004-providers-behind-one-interface.html">← Part 4: Providers Behind One Interface</a>
+      <a href="../reference/agent-architecture.html">Reference: Agent architecture</a>
+      <a href="../reference/tool-design.html">Reference: Tool design</a>
+      <a href="../reference/glossary.html">Glossary</a>
+    </nav>
+
+    <header>
+      <p class="lesson-kicker">Coding an AI Agent · Part 5 · Stage A · Harness</p>
+      <h1>Why Effect</h1>
+      <p class="subtitle">Rewrite the agent so that every failure shows in a type. Tools fail with typed errors, a Schema validates each tool's input, and the program separates the errors the model reads from the errors the user reads. The code also moves from one file to eight.</p>
+    </header>
+
+    <section>
+      <h2>Start from the failures</h2>
+      <p>
+        The agent from Part 4 has four kinds of failure, and the code handles each of them differently. None of the four shows in a type.
+      </p>
+      <table>
+        <tr><th>Failure</th><th>Where it is raised</th><th>What happens in Part 4</th></tr>
+        <tr><td>A tool is unknown, its input is wrong, the user declines, or the tool's code throws</td><td>Inside <code>runTool</code></td><td>The <code>catch</code> turns it into an error result and the model reads it</td></tr>
+        <tr><td>A bug in the agent's own code that runs inside that <code>try</code> block, for example in a <code>confirm</code> function</td><td>Inside <code>runTool</code></td><td>The same <code>catch</code> turns it into an error result. The model is told about a mistake that only the author can fix</td></tr>
+        <tr><td>The model request fails: server not running, a 404, a reply that cannot be read</td><td><code>chat</code></td><td>The error is thrown out of the loop and the program exits</td></tr>
+        <tr><td>Input ends, from piped input or Ctrl-D</td><td><code>rl.question</code></td><td>The call throws <code>readline was closed</code>, or, when input ends during a question, never returns</td></tr>
+      </table>
+      <p>
+        The first row works because Part 3 put one <code>try</code>/<code>catch</code> around the whole call. The other rows show what that does not express.
+        TypeScript does not distinguish a failure the model can fix from a bug, or from a failure that only the user can fix, and a function's type does not say whether it can throw at all.
+        Part 1 already ran into the last point. Pointing <code>list_files</code> at a directory that does not exist ended the program:
+      </p>
+<pre><code>import { readdir } from "node:fs/promises"
+
+const listFiles = async (path: string) =&gt; {
+  const entries = await readdir(path, { withFileTypes: true })
+  return entries.map((entry) =&gt; (entry.isDirectory() ? `${entry.name}/` : entry.name)).join("\n")
+}
+
+console.log(await listFiles("missing"))</code></pre>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../plain.ts
+4 |   const entries = await readdir(path, { withFileTypes: true })
+                            ^
+ENOENT: no such file or directory, scandir 'missing'
+    path: "missing",
+ syscall: "scandir",
+   errno: -2,
+    code: "ENOENT"</code></pre>
+      <p>
+        The type of <code>listFiles</code> is <code>(path: string) =&gt; Promise&lt;string&gt;</code>. Nothing in it mentions <code>ENOENT</code>.
+        This post moves the agent to Effect, a library whose central idea is to put the failure into the type.
+      </p>
+    </section>
+
+    <section>
+      <h2>What Effect adds</h2>
+      <p>
+        Effect's own introduction, <a href="https://effect.website/docs/getting-started/why-effect/" target="_blank" rel="noopener">Why Effect?</a>, makes the same observation about a plain <code>divide</code> function:
+        "Based on the types, we have no idea that this function can throw an exception." Its core claim is that "we can use the type system to track errors and context, not only success values."
+        The page is part of the v3 documentation, and OpenCode uses v4, so some names differ; the <a href="https://github.com/Effect-TS/effect/blob/main/MIGRATION.md" target="_blank" rel="noopener">v3 to v4 migration guide</a> lists them. The snippets in this post were run on Effect 4.1.0, the version OpenCode pins at the time of writing.
+      </p>
+      <p>
+        This section covers the four ideas the rest of the post uses. Each snippet was run on its own before it went into the post.
+      </p>
+
+      <h3>1. An Effect is a value with three type parameters</h3>
+      <p>
+        <code>Effect&lt;A, E, R&gt;</code> describes a computation that produces an <code>A</code>, can fail with an <code>E</code>, and needs an <code>R</code> to run.
+        <code>R</code> stands for requirements such as services. It stays <code>never</code> (nothing is required) in this post, and Part 6 uses it.
+        Here <code>listFiles</code> is written again, with the failure as a class. <code>Schema.TaggedError</code> defines a class whose instances carry a <code>_tag</code> that names the failure, and Schema gives its fields their types:
+      </p>
+<pre><code>import { Effect, Schema } from "effect"
+import { readdir } from "node:fs/promises"
+
+class NotListable extends Schema.TaggedError&lt;NotListable&gt;()("NotListable", {
+  path: Schema.String,
+  reason: Schema.String,
+}) {}
+
+const listFiles = (path: string) =&gt;
+  Effect.tryPromise({
+    try: () =&gt; readdir(path, { withFileTypes: true }),
+    catch: (error) =&gt; new NotListable({ path, reason: error instanceof Error ? error.message : String(error) }),
+  }).pipe(Effect.map((entries) =&gt; entries.map((entry) =&gt; (entry.isDirectory() ? `${entry.name}/` : entry.name)).join("\n")))</code></pre>
+      <p>
+        <code>Effect.tryPromise</code> runs a function that returns a promise, and <code>catch</code> turns whatever it rejects with into the typed failure.
+        The type of <code>listFiles</code> is now <code>(path: string) =&gt; Effect&lt;string, NotListable, never&gt;</code>: it produces a string, can fail with <code>NotListable</code>, and requires nothing.
+        The compiler enforces this. Assigning the result to an Effect that cannot fail is an error:
+      </p>
+<pre><code>const sure: Effect.Effect&lt;string&gt; = listFiles("missing")</code></pre>
+<pre class="transcript"><code>$ bunx --package typescript tsc --noEmit
+effect2.ts(4,7): error TS2322: Type 'Effect&lt;string, NotListable, never&gt;' is not assignable to type 'Effect&lt;string, never, never&gt;'.
+  Type 'NotListable' is not assignable to type 'never'.</code></pre>
+
+      <h3>2. <code>Effect.gen</code> and <code>yield*</code> play the role of <code>async</code> and <code>await</code></h3>
+      <p>
+        Inside <code>Effect.gen</code>, <code>yield*</code> runs another Effect and gives back its success value. If that Effect fails, the generator stops and the Effect it belongs to fails with the same error:
+      </p>
+<pre><code>const listBoth = Effect.gen(function* () {
+  console.log("listing")
+  const here = yield* listFiles(".")
+  const notes = yield* listFiles("notes")
+  return `${here}\n${notes}`
+})
+// listBoth: Effect&lt;string, NotListable, never&gt;</code></pre>
+      <p>
+        The error types of the steps are combined, so <code>listBoth</code> has the same <code>NotListable</code> in its type without anyone writing it down.
+        With <code>async</code> functions this information is lost at every <code>await</code>.
+      </p>
+
+      <h3>3. An Effect describes work and does nothing until it is run</h3>
+      <p>
+        Building <code>listBoth</code> does not list any directory. The work starts when the Effect is run, and a program does that once, at its edge. <code>Effect.runPromise</code> is the usual way:
+      </p>
+<pre><code>console.log("built the Effect")
+console.log(await Effect.runPromise(listBoth))</code></pre>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../effect3.ts
+built the Effect
+listing
+secret-file.txt
+README.md
+notes/
+todo.txt</code></pre>
+      <p>
+        <code>listing</code> prints after <code>built the Effect</code>. An Effect that is created and never yielded or run does nothing, and the compiler does not report it. A missing <code>yield*</code> is a mistake to look for when a step seems to be skipped.
+      </p>
+
+      <h3>4. A failure is handled by its type, and the type shrinks</h3>
+      <p>
+        <code>Effect.catch</code> takes a handler for the typed failure. After it, <code>E</code> is <code>never</code>, and the earlier compiler error disappears:
+      </p>
+<pre><code>const safe = listFiles("missing").pipe(
+  Effect.catch((error) =&gt; Effect.succeed(`Could not list ${error.path}: ${error.reason}`)),
+)
+const sure: Effect.Effect&lt;string&gt; = safe</code></pre>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../effect4.ts
+Could not list missing: ENOENT: no such file or directory, scandir 'missing'</code></pre>
+      <p>
+        There is a second kind of failure that <code>Effect.catch</code> does not see. A <strong>defect</strong> is an error nobody planned for, such as an exception thrown by a bug.
+        It is not part of <code>E</code>, it passes through <code>Effect.catch</code>, and it has its own handler, <code>Effect.catchDefect</code>. The agent uses this difference to keep bugs away from the model.
+      </p>
+    </section>
+
+    <section>
+      <h2>Five decisions in the rewrite</h2>
+
+      <h3>1. A tool failure is a typed class</h3>
+      <p>
+        The glossary has a term for this: a <strong>tool failure</strong> is a typed error raised while running a tool call, and the agent turns it into an error tool result.
+        The agent has four, each with the fields that describe it and a <code>message</code> that becomes the text the model reads:
+      </p>
+      <table>
+        <tr><th>Failure</th><th>Raised when</th><th>What the model reads</th></tr>
+        <tr><td><code>UnknownTool</code></td><td>The call names a tool that is not registered</td><td><code>Unknown tool: x. Available tools: list_files, read_file, …</code></td></tr>
+        <tr><td><code>InvalidInput</code></td><td>The arguments are not valid JSON, or do not fit the tool's Schema</td><td>Each problem, then the fields the tool takes</td></tr>
+        <tr><td><code>Declined</code></td><td>The user answers anything but <code>y</code>, or there is no answer</td><td><code>User declined this action. Ask what they would like instead.</code></td></tr>
+        <tr><td><code>ToolCrashed</code></td><td>The tool's own code throws or rejects: a missing file, a bad edit, a command that timed out</td><td>The error's message, as in Part 3</td></tr>
+      </table>
+      <p>
+        Part 4 had these messages as strings in four places. Now each is a class, and a function that can raise one has it in its type.
+      </p>
+
+      <h3>2. One place turns a failure into a result</h3>
+      <p>
+        Each tool's <code>run</code> has the type <code>Effect&lt;string, ToolFailure&gt;</code>, where <code>ToolFailure</code> is the union of the four classes. <code>runTool</code> runs it and converts both outcomes into the same result type as in Part 4:
+        a string becomes <code>{ type: "text" }</code> and a failure becomes <code>{ type: "error" }</code>. Its return type is <code>Effect&lt;ToolResultPart&gt;</code>, which is <code>Effect&lt;ToolResultPart, never, never&gt;</code> with the defaults left out.
+        The protocols are unchanged, because they only ever see a tool result.
+      </p>
+      <p>
+        The union is checked. If <code>run</code> is changed so that it can fail with something that is not in <code>ToolFailure</code>, for example a <code>ProviderError</code>, the compiler reports it where the <code>Tool</code> is built, before anything runs:
+      </p>
+<pre class="transcript"><code>src/tool.ts(34,7): error TS2322: Type 'Effect&lt;string, Declined | InvalidInput | ProviderError | ToolCrashed, S["DecodingServices"]&gt;' is not assignable to type 'Effect&lt;string, ToolFailure, never&gt;'.</code></pre>
+
+      <h3>3. Expected failures and defects are separate</h3>
+      <p>
+        <code>runTool</code> handles the typed failures only. A bug inside the agent, such as a function that throws while describing a confirmation, is a defect. It is not converted into a tool result.
+        OpenCode draws the same line. The comment on its <code>ToolFailure</code> says that handlers must map their errors to it, and that the runtime surfaces those as an error result "so the model can self-correct".
+        It continues: "Anything thrown or yielded by a handler that is not a <code>ToolFailure</code> is treated as a defect and fails the stream"
+        (<a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/ai/src/schema/errors.ts" target="_blank" rel="noopener">schema/errors.ts</a>).
+        Its tool guidelines add that interruption and defects must survive, so they do not use <code>catchCause</code> there
+        (<a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/tool/AGENTS.md" target="_blank" rel="noopener">tool/AGENTS.md</a>).
+      </p>
+
+      <h3>4. Provider errors reach the user, and the turn is dropped</h3>
+      <p>
+        A failed model request is not something the model can act on. <code>chat</code> now fails with a <code>ProviderError</code> that carries the status and body, or says that the server could not be reached or its reply could not be read.
+        The prompt loop catches it, together with defects, prints it, and returns to <code>You:</code>.
+      </p>
+      <p>
+        The turn that failed is removed from the history. A turn can fail after the model asked for tools and before their results were added, and a history that ends with a tool call and no result is not valid for either protocol (Part 3: every call needs its own result).
+        Cutting the history back to its length before the prompt keeps the next prompt on a consistent conversation.
+      </p>
+
+      <h3>5. One Schema describes a tool's input</h3>
+      <p>
+        In Part 4 a tool's input was described twice: a JSON Schema object for the model and <code>field()</code> calls for validation. They could drift apart.
+        Now each tool declares one <code>Schema.Struct</code>. <code>Schema.decodeUnknownEffect</code> validates the model's arguments against it, and <code>Schema.toJsonSchemaDocument</code> produces the JSON Schema that goes into the request.
+        OpenCode uses both functions for the same two jobs in <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/ai/src/tool.ts" target="_blank" rel="noopener">ai/src/tool.ts</a>.
+      </p>
+      <p>
+        Schema's default messages for a wrong input are short. For <code>{}</code> and for <code>{ path: 42 }</code> against a Schema with a <code>path</code> string field they are:
+      </p>
+<pre class="transcript"><code>Missing key
+  at ["path"]
+
+Expected string
+  at ["path"]</code></pre>
+      <p>
+        Part 3 gave the model <code>path must be a string, e.g. src/index.ts</code>, which names the field and says what to send. The default text names the field and the problem, and leaves out what the tool takes.
+        <code>InvalidInput</code> lists every problem as <code>field: problem</code> and then names the fields the tool takes, so the message keeps that purpose. Step 6 shows a model correcting a call from it.
+      </p>
+
+      <div class="compare">
+        <figure>
+          <figcaption>The agent (Part 5)</figcaption>
+<pre><code>type Tool = {
+  name: string
+  description: string
+  parameters: Record&lt;string, unknown&gt; // JSON Schema
+  run: (input: unknown) =&gt; Effect.Effect&lt;string, ToolFailure&gt;
+}</code></pre>
+        </figure>
+        <figure>
+          <figcaption>OpenCode (ai/src/tool.ts, abridged)</figcaption>
+<pre><code>interface Tool&lt;Input, Success&gt; {
+  readonly name: string
+  readonly description: string
+  readonly input: Input // an Effect Schema
+  readonly success: Success // an Effect Schema
+  readonly execute?: ToolExecute&lt;Input, Success&gt;
+  // memoized codecs, a precomputed definition, ...
+}
+
+type ToolExecute&lt;Input, Success&gt; = (
+  input: ToolInputType&lt;Input&gt;,
+  context?: ToolExecuteContext,
+) =&gt; Effect.Effect&lt;Schema.Schema.Type&lt;Success&gt;, ToolFailure&gt;</code></pre>
+        </figure>
+      </div>
+      <p>
+        The agent keeps the Schema inside the tool. <code>defineTool</code> takes a typed <code>execute</code> and builds a <code>run</code> that decodes the raw input, asks for confirmation and calls <code>execute</code>.
+        That makes the registry a plain <code>Tool[]</code> whatever the tools' input types are. OpenCode's tool object carries the Schema and a decoder for it, and its <code>execute</code> receives the decoded input. It also has a second Schema for the output.
+        Its tool guidelines state that the registry erases the definitions' types at that boundary
+        (<a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/tool/AGENTS.md" target="_blank" rel="noopener">tool/AGENTS.md</a>).
+      </p>
+    </section>
+
+    <section>
+      <h2>Check yourself</h2>
+
+      <p>Sort each event by who reads the resulting error.</p>
+
+      <div class="quiz">
+        <p class="quiz-question">A file the model asked for does not exist.</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">The user, as a provider error</button>
+          <button class="quiz-option" data-correct="true">The model, as a tool failure</button>
+          <button class="quiz-option" data-correct="false">The user, as a defect printed by the turn handler</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. It is a &lt;code&gt;ToolCrashed&lt;/code&gt;, so it goes back as an error result and the model can pick another path." data-wrong-text="The model can act on a missing file, so it is a tool failure that goes back as an error result." hidden></p>
+      </div>
+
+
+      <div class="quiz">
+        <p class="quiz-question">The Ollama server is not running.</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="true">The user, as a provider error</button>
+          <button class="quiz-option" data-correct="false">The model, as a tool failure</button>
+          <button class="quiz-option" data-correct="false">The model, as a defect</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. The model cannot start a server. &lt;code&gt;chat&lt;/code&gt; fails with a &lt;code&gt;ProviderError&lt;/code&gt;, which is printed and the turn is dropped." data-wrong-text="The model cannot act on it. &lt;code&gt;chat&lt;/code&gt; fails with a &lt;code&gt;ProviderError&lt;/code&gt; that the prompt loop prints." hidden></p>
+      </div>
+
+
+      <div class="quiz">
+        <p class="quiz-question">A function that describes a confirmation throws a <code>TypeError</code> because of a typo in the agent's code.</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">The model, as a tool failure</button>
+          <button class="quiz-option" data-correct="false">The user, as a provider error</button>
+          <button class="quiz-option" data-correct="true">The user, as a defect printed by the turn handler</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. A bug is not a typed failure, so &lt;code&gt;runTool&lt;/code&gt; does not convert it. &lt;code&gt;Effect.catchDefect&lt;/code&gt; in the prompt loop prints it." data-wrong-text="It is a defect, not a typed failure. &lt;code&gt;runTool&lt;/code&gt; leaves it alone and the prompt loop&#x27;s &lt;code&gt;Effect.catchDefect&lt;/code&gt; prints it." hidden></p>
+      </div>
+
+
+      <div class="quiz">
+        <p class="quiz-question">What does the type <code>Effect&lt;ToolResultPart, never, never&gt;</code> of <code>runTool</code> promise its caller?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">That the tool always succeeds</button>
+          <button class="quiz-option" data-correct="false">That no tool is ever run</button>
+          <button class="quiz-option" data-correct="true">That running it cannot fail with a typed error, because every tool failure has become a result</button>
+          <button class="quiz-option" data-correct="false">That it needs no confirmation from the user</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. &lt;code&gt;never&lt;/code&gt; in the second slot means no typed failure remains. Defects are still possible." data-wrong-text="The second slot is the failure type. &lt;code&gt;never&lt;/code&gt; there means no typed failure can come out." hidden></p>
+      </div>
+
+
+      <div class="quiz">
+        <p class="quiz-question">What does <code>yield*</code> do inside <code>Effect.gen</code> when the Effect it is given fails?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">It returns the error as a value and keeps going</button>
+          <button class="quiz-option" data-correct="false">It retries the Effect once</button>
+          <button class="quiz-option" data-correct="true">It stops the generator, and the Effect being built fails with the same error</button>
+          <button class="quiz-option" data-correct="false">It converts the error into a defect</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. That is how the error type of &lt;code&gt;listBoth&lt;/code&gt; is the combination of its steps&#x27; error types." data-wrong-text="A failure stops the generator and becomes the failure of the whole Effect. To keep going, handle it first with &lt;code&gt;Effect.catch&lt;/code&gt;." hidden></p>
+      </div>
+
+
+      <div class="quiz">
+        <p class="quiz-question">A line <code>runTool(tools, call)</code> appears in the loop as a statement, without <code>yield*</code> and without using its value. What happens?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">The tool runs and the result is ignored</button>
+          <button class="quiz-option" data-correct="true">The Effect is created and nothing runs</button>
+          <button class="quiz-option" data-correct="false">The compiler refuses to build the file</button>
+          <button class="quiz-option" data-correct="false">The tool runs twice</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. An Effect only describes work, and the compiler accepts a statement that ignores it. A missing &lt;code&gt;yield*&lt;/code&gt; is worth checking first when a step seems skipped." data-wrong-text="An Effect that is never yielded or run does nothing, and a statement that ignores it compiles." hidden></p>
+      </div>
+
+
+      <div class="quiz">
+        <p class="quiz-question">Why does a failed turn get removed from the history?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">To save memory</button>
+          <button class="quiz-option" data-correct="false">Because the provider asks for it</button>
+          <button class="quiz-option" data-correct="true">Because it can end with a tool call that has no result, which both protocols reject</button>
+          <button class="quiz-option" data-correct="false">Because the user must retype the prompt</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. Cutting back to the length before the prompt leaves a conversation that is valid for the next request." data-wrong-text="A turn can fail after the model asked for tools and before their results were added. That history is not valid for the next request." hidden></p>
+      </div>
+
+    </section>
+
+    <section>
+      <h2>Your turn: the same agent, in Effect</h2>
+      <p>
+        Work in the <code>my-agent</code> folder from Part 4. Parts 1 to 4 kept the agent in one <code>index.ts</code> in the project folder. From this part the code lives in eight files in a new <code>src</code> folder,
+        and step 1 does the split before anything else changes:
+      </p>
+      <table>
+        <tr><th>File</th><th>Contents</th></tr>
+        <tr><td><code>src/messages.ts</code></td><td>The message and part types, <code>isToolCall</code> and <code>textOf</code></td></tr>
+        <tr><td><code>src/errors.ts</code></td><td>The four tool failures, <code>ProviderError</code> and <code>InputClosed</code></td></tr>
+        <tr><td><code>src/terminal.ts</code></td><td>The readline interface and <code>ask</code></td></tr>
+        <tr><td><code>src/tool.ts</code></td><td><code>Tool</code>, <code>defineTool</code> and <code>runTool</code></td></tr>
+        <tr><td><code>src/tools.ts</code></td><td>The five tools and the <code>tools</code> array</td></tr>
+        <tr><td><code>src/protocols.ts</code></td><td><code>Protocol</code>, <code>openaiChat</code> and <code>anthropicMessages</code>, unchanged from Part 4</td></tr>
+        <tr><td><code>src/provider.ts</code></td><td>The routes, route selection from <code>PROVIDER</code>, and <code>chat</code></td></tr>
+        <tr><td><code>src/index.ts</code></td><td>The prompt loop</td></tr>
+      </table>
+
+      <h3>Step 1: Move the agent into <code>src</code> and split it into files</h3>
+      <p>
+        This step changes no behavior. It moves the Part 4 code into seven files and makes two small signature changes so that <code>tool.ts</code> and <code>tools.ts</code> do not import each other:
+        <code>runTool</code> and <code>chat</code> receive the list of tools as an argument instead of reading a global.
+        Create a <code>src</code> folder in the project, create the seven files below in it, and delete the old <code>index.ts</code> from the project folder. The last file, <code>src/index.ts</code>, takes its place.
+        <code>tools.ts</code> and <code>protocols.ts</code> are long, so they are collapsed.
+      </p>
+<p class="where"><code>src/messages.ts</code></p>
+<pre><code>// The agent's own message types. No protocol appears in them.
+export type TextPart = { type: "text"; text: string }
+export type ToolCallPart = { type: "tool-call"; id: string; name: string; input: unknown }
+export type ToolResultValue = { type: "text" | "error"; value: string }
+export type ToolResultPart = { type: "tool-result"; id: string; name: string; result: ToolResultValue }
+export type Part = TextPart | ToolCallPart | ToolResultPart
+
+export type Message = {
+  role: "user" | "assistant" | "tool"
+  content: Part[]
+  // The provider's own content for this message, kept so the same protocol can send it back unchanged.
+  native?: unknown
+}
+
+export const isToolCall = (part: Part): part is ToolCallPart =&gt; part.type === "tool-call"
+export const textOf = (message: Message) =&gt; message.content.flatMap((part) =&gt; (part.type === "text" ? [part.text] : [])).join("\n")</code></pre>
+<p class="where"><code>src/terminal.ts</code></p>
+<pre><code>import { createInterface } from "node:readline/promises"
+
+export const rl = createInterface({ input: process.stdin, output: process.stdout })</code></pre>
+<p class="where"><code>src/tool.ts</code></p>
+<pre><code>import type { ToolCallPart, ToolResultPart, ToolResultValue } from "./messages"
+import { rl } from "./terminal"
+
+export type Tool = {
+  name: string
+  description: string
+  parameters: Record&lt;string, unknown&gt; // JSON Schema, shared by both protocols
+  execute: (input: unknown) =&gt; Promise&lt;string&gt;
+  confirm?: (input: unknown) =&gt; string // describes the action; when set, the user must approve it first
+}
+
+// Reads one string field from model input, or throws a message that says how to fix it.
+export const field = (input: unknown, key: string, example: string): string =&gt; {
+  const value = typeof input === "object" &amp;&amp; input !== null ? (input as Record&lt;string, unknown&gt;)[key] : undefined
+  if (typeof value !== "string") throw new Error(`${key} must be a string, e.g. ${example}`)
+  return value
+}
+
+// Never throws: every failure becomes a tool result the model can read.
+export const runTool = async (tools: Tool[], call: ToolCallPart): Promise&lt;ToolResultPart&gt; =&gt; {
+  const done = (result: ToolResultValue): ToolResultPart =&gt; ({ type: "tool-result", id: call.id, name: call.name, result })
+
+  try {
+    const tool = tools.find((tool) =&gt; tool.name === call.name)
+    if (!tool) throw new Error(`Unknown tool: ${call.name}. Available tools: ${tools.map((tool) =&gt; tool.name).join(", ")}`)
+
+    // A string input is arguments that were not valid JSON; the protocol keeps the raw text.
+    if (typeof call.input === "string") throw new Error(`The arguments are not valid JSON: ${call.input}`)
+
+    if (tool.confirm) {
+      const answer = await rl.question(`Allow: ${tool.confirm(call.input)}? [y/N] `)
+      if (answer.trim().toLowerCase() !== "y") throw new Error("User declined this action. Ask what they would like instead.")
+    }
+    return done({ type: "text", value: await tool.execute(call.input) })
+  } catch (error) {
+    return done({ type: "error", value: error instanceof Error ? error.message : String(error) })
+  }
+}</code></pre>
+<details class="reveal">
+<summary>src/tools.ts</summary>
+<pre><code>import { execFile } from "node:child_process"
+import { existsSync } from "node:fs"
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises"
+import { dirname } from "node:path"
+import { field, type Tool } from "./tool"
+
+const listFiles = async (path: string) =&gt; {
+  const entries = await readdir(path, { withFileTypes: true })
+  return entries.map((entry) =&gt; (entry.isDirectory() ? `${entry.name}/` : entry.name)).join("\n")
+}
+
+const editFile = async (path: string, oldStr: string, newStr: string) =&gt; {
+  if (oldStr === newStr) throw new Error("old_str and new_str must be different")
+
+  if (oldStr === "") {
+    if (existsSync(path)) throw new Error(`${path} already exists; pass the text to replace as old_str`)
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, newStr)
+    return `Created ${path}`
+  }
+
+  const content = await readFile(path, "utf8")
+  const matches = content.split(oldStr).length - 1
+  if (matches === 0) throw new Error(`old_str was not found in ${path}`)
+  if (matches &gt; 1) throw new Error(`old_str matches ${matches} places in ${path}; include more surrounding text`)
+  await writeFile(path, content.replace(oldStr, () =&gt; newStr))
+  return "OK"
+}
+
+const saveFile = async (path: string, content: string) =&gt; {
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, content)
+  return `Wrote ${content.length} characters to ${path}`
+}
+
+const TIMEOUT_MS = 30_000
+const MAX_OUTPUT = 10_000
+
+const runBash = (command: string) =&gt;
+  new Promise&lt;string&gt;((resolve, reject) =&gt; {
+    execFile("bash", ["-c", command], { timeout: TIMEOUT_MS, maxBuffer: 10_000_000 }, (error, stdout, stderr) =&gt; {
+      if (error?.killed) return reject(new Error(`The command ran longer than ${TIMEOUT_MS} ms and was stopped. Try a faster command.`))
+      if (error &amp;&amp; typeof error.code !== "number") return reject(error)
+      const output = `${stdout}${stderr}`
+      const shown =
+        output.length &gt; MAX_OUTPUT
+          ? `${output.slice(0, MAX_OUTPUT)}\n[Output truncated after ${MAX_OUTPUT} characters. Filter it with head, tail or grep.]`
+          : output
+      resolve(`Exit code: ${error ? error.code : 0}\n${shown}`)
+    })
+  })
+
+export const tools: Tool[] = [
+  {
+    name: "list_files",
+    description:
+      "List the files and directories at a path. Directory names end with a slash. Use it whenever you need to know what exists. Pass '.' for the current directory.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", description: "Directory to list, e.g. '.' or 'notes'" } },
+      required: ["path"],
+    },
+    execute: (input) =&gt; listFiles(field(input, "path", "'.' or 'src'")),
+  },
+  {
+    name: "read_file",
+    description:
+      "Read the full text contents of a file. Use it when you need to see what is inside a file. Do not use it on directories; use list_files for those.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", description: "Path of the file to read, e.g. 'README.md'" } },
+      required: ["path"],
+    },
+    execute: (input) =&gt; readFile(field(input, "path", "src/index.ts"), "utf8"),
+  },
+  {
+    name: "edit_file",
+    description:
+      "Edit a text file by replacing old_str with new_str. old_str must match exactly one place in the file, character for character, including whitespace, so read the file first and copy it. To create a new file, use a path that does not exist and set old_str to an empty string; new_str becomes the whole file.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path of the file to edit or create" },
+        old_str: { type: "string", description: "Text to replace. Empty to create a new file." },
+        new_str: { type: "string", description: "Text to put in its place" },
+      },
+      required: ["path", "old_str", "new_str"],
+    },
+    execute: (input) =&gt;
+      editFile(
+        field(input, "path", "src/index.ts"),
+        field(input, "old_str", "const a = 1 (or an empty string to create a file)"),
+        field(input, "new_str", "const a = 2"),
+      ),
+    confirm: (input) =&gt; `edit ${field(input, "path", "src/index.ts")}`,
+  },
+  {
+    name: "write_file",
+    description:
+      "Write a complete text file, replacing it if it already exists and creating missing folders. Use it to create a new file or to rewrite a file entirely. For a small change to an existing file, use edit_file instead, because it sends only the part that changes. The content you pass becomes the whole file.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path of the file to write, e.g. 'notes/plan.md'" },
+        content: { type: "string", description: "The full text of the file" },
+      },
+      required: ["path", "content"],
+    },
+    execute: (input) =&gt; saveFile(field(input, "path", "notes/plan.md"), field(input, "content", "the full text of the file")),
+    confirm: (input) =&gt; `write ${field(input, "path", "notes/plan.md")}`,
+  },
+  {
+    name: "bash",
+    description:
+      "Run a shell command with bash in the current directory and return its output and exit code. Use it for things the other tools cannot do, such as running a script, a test or git. Commands stop after 30 seconds and long output is cut off, so filter it with head, tail or grep when you expect a lot. Prefer read_file and list_files for reading, because they are cheaper and safer.",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string", description: "The command to run, e.g. 'ls -la' or 'bun test'" } },
+      required: ["command"],
+    },
+    execute: (input) =&gt; runBash(field(input, "command", "ls -la")),
+    confirm: (input) =&gt; `run: ${field(input, "command", "ls -la")}`,
+  },
+]</code></pre>
+</details>
+<details class="reveal">
+<summary>src/protocols.ts</summary>
+<pre><code>import { isToolCall, textOf, type Message, type Part } from "./messages"
+import type { Tool } from "./tool"
+
+export type Reply = { message: Message; finish: "tool-calls" | "stop" | "refusal" }
+
+// A protocol turns the agent's types into one wire format and back.
+export type Protocol = {
+  path: string
+  body: (model: string, history: Message[], tools: Tool[]) =&gt; unknown
+  decode: (json: unknown) =&gt; Reply
+}
+
+// OpenAI Chat Completions: what Ollama and llama.cpp speak. Only this section knows its wire format.
+type OpenAIResponse = {
+  choices: { message: { content: string | null; tool_calls?: { id: string; function: { name: string; arguments: string } }[] } }[]
+}
+
+const toOpenAITool = (tool: Tool) =&gt; ({
+  type: "function",
+  function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+})
+
+const toOpenAIMessages = (message: Message): unknown[] =&gt; {
+  if (message.role === "tool") {
+    // One role: "tool" message per result. There is no error flag, so the text carries the failure.
+    return message.content.flatMap((part) =&gt;
+      part.type === "tool-result"
+        ? [{ role: "tool", tool_call_id: part.id, content: part.result.type === "error" ? `Error: ${part.result.value}` : part.result.value }]
+        : [],
+    )
+  }
+  if (message.role === "assistant") {
+    const calls = message.content.filter(isToolCall).map((call) =&gt; ({
+      id: call.id,
+      type: "function",
+      // A string input is raw text that did not parse; send it back as it came.
+      function: { name: call.name, arguments: typeof call.input === "string" ? call.input : JSON.stringify(call.input) },
+    }))
+    return [{ role: "assistant", content: textOf(message) || null, ...(calls.length ? { tool_calls: calls } : {}) }]
+  }
+  return [{ role: "user", content: textOf(message) }]
+}
+
+// Arguments arrive as a JSON string. If it does not parse, keep the raw text as the input.
+const parseArguments = (raw: string): unknown =&gt; {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return raw
+  }
+}
+
+export const openaiChat: Protocol = {
+  path: "/chat/completions",
+  body: (model, history, tools) =&gt; ({
+    model,
+    messages: history.flatMap(toOpenAIMessages),
+    reasoning_effort: "none",
+    tools: tools.map(toOpenAITool),
+  }),
+  decode: (json) =&gt; {
+    const message = (json as OpenAIResponse).choices[0]?.message
+    if (!message) throw new Error("No choices returned from model")
+    const content: Part[] = []
+    if (message.content) content.push({ type: "text", text: message.content })
+    for (const call of message.tool_calls ?? []) {
+      content.push({ type: "tool-call", id: call.id, name: call.function.name, input: parseArguments(call.function.arguments) })
+    }
+    return { message: { role: "assistant", content }, finish: content.some(isToolCall) ? "tool-calls" : "stop" }
+  },
+}
+
+// Anthropic Messages: what Claude speaks.
+type AnthropicText = { type: "text"; text: string }
+type AnthropicToolUse = { type: "tool_use"; id: string; name: string; input: unknown }
+type AnthropicBlock = AnthropicText | AnthropicToolUse | { type: string } // e.g. thinking blocks
+type AnthropicResponse = { content: AnthropicBlock[]; stop_reason: string }
+
+const isText = (block: AnthropicBlock): block is AnthropicText =&gt; block.type === "text"
+const isToolUse = (block: AnthropicBlock): block is AnthropicToolUse =&gt; block.type === "tool_use"
+
+// Same name and description as every other tool, but the schema is called input_schema.
+const toAnthropicTool = (tool: Tool) =&gt; ({ name: tool.name, description: tool.description, input_schema: tool.parameters })
+
+const toAnthropicMessage = (message: Message): unknown =&gt; {
+  if (message.role === "tool") {
+    // All the results of a step go back in one user message, and failures carry is_error.
+    return {
+      role: "user",
+      content: message.content.flatMap((part) =&gt;
+        part.type === "tool-result"
+          ? [{ type: "tool_result", tool_use_id: part.id, content: part.result.value, is_error: part.result.type === "error" }]
+          : [],
+      ),
+    }
+  }
+  if (message.role === "assistant") {
+    // Send back exactly what the model produced, thinking blocks included, when we kept it.
+    if (message.native) return { role: "assistant", content: message.native }
+    return {
+      role: "assistant",
+      content: message.content.flatMap((part): unknown[] =&gt;
+        part.type === "text"
+          ? [{ type: "text", text: part.text }]
+          : part.type === "tool-call"
+            ? [{ type: "tool_use", id: part.id, name: part.name, input: part.input }]
+            : [],
+      ),
+    }
+  }
+  return { role: "user", content: textOf(message) }
+}
+
+export const anthropicMessages: Protocol = {
+  path: "/v1/messages",
+  body: (model, history, tools) =&gt; ({
+    model,
+    max_tokens: 16000,
+    messages: history.map(toAnthropicMessage),
+    tools: tools.map(toAnthropicTool),
+  }),
+  decode: (json) =&gt; {
+    const data = json as AnthropicResponse
+    const content: Part[] = []
+    for (const block of data.content) {
+      if (isText(block)) content.push({ type: "text", text: block.text })
+      else if (isToolUse(block)) content.push({ type: "tool-call", id: block.id, name: block.name, input: block.input })
+    }
+    const finish = data.stop_reason === "refusal" ? "refusal" : content.some(isToolCall) ? "tool-calls" : "stop"
+    return { message: { role: "assistant", content, native: data.content }, finish }
+  },
+}</code></pre>
+</details>
+<p class="where"><code>src/provider.ts</code></p>
+<pre><code>import type { Message } from "./messages"
+import { anthropicMessages, openaiChat, type Protocol, type Reply } from "./protocols"
+import type { Tool } from "./tool"
+
+// A route binds a protocol to one provider's endpoint and authentication.
+export type Route = { protocol: Protocol; baseUrl: string; headers: Record&lt;string, string&gt;; model: string }
+
+const routes: Record&lt;string, Route&gt; = {
+  ollama: { protocol: openaiChat, baseUrl: "http://127.0.0.1:11434/v1", headers: {}, model: "qwen3.5:9b" },
+  llamacpp: { protocol: openaiChat, baseUrl: "http://127.0.0.1:9931/v1", headers: {}, model: "qwen3.5:9b" },
+  claude: {
+    protocol: anthropicMessages,
+    baseUrl: "https://api.anthropic.com",
+    headers: { "x-api-key": process.env.ANTHROPIC_API_KEY ?? "", "anthropic-version": "2026-10-21" },
+    model: "claude-sonnet-5-5",
+  },
+}
+
+const providerName = process.env.PROVIDER ?? "ollama"
+const selected = routes[providerName]
+if (!selected) throw new Error(`Unknown PROVIDER "${providerName}". Choose one of: ${Object.keys(routes).join(", ")}`)
+if (providerName === "claude" &amp;&amp; !process.env.ANTHROPIC_API_KEY) throw new Error("Set ANTHROPIC_API_KEY first")
+
+// BASE_URL and MODEL still override the route's defaults.
+const route: Route = {
+  ...selected,
+  baseUrl: process.env.BASE_URL ?? selected.baseUrl,
+  model: process.env.MODEL ?? selected.model,
+}
+
+export const chat = async (history: Message[], tools: Tool[]): Promise&lt;Reply&gt; =&gt; {
+  const response = await fetch(`${route.baseUrl}${route.protocol.path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...route.headers },
+    body: JSON.stringify(route.protocol.body(route.model, history, tools)),
+  })
+  if (!response.ok) throw new Error(await response.text())
+  return route.protocol.decode(await response.json())
+}</code></pre>
+<p class="where"><code>src/index.ts</code></p>
+<pre><code>import { isToolCall, type Message, type ToolResultPart } from "./messages"
+import { chat } from "./provider"
+import { rl } from "./terminal"
+import { runTool } from "./tool"
+import { tools } from "./tools"
+
+const history: Message[] = []
+
+while (true) {
+  const input = await rl.question("You: ")
+  history.push({ role: "user", content: [{ type: "text", text: input }] })
+
+  while (true) {
+    const { message, finish } = await chat(history, tools)
+    history.push(message)
+    for (const part of message.content) {
+      if (part.type === "text" &amp;&amp; part.text) console.log(`Agent: ${part.text}`)
+    }
+    if (finish !== "tool-calls") break
+
+    const results: ToolResultPart[] = []
+    for (const call of message.content.filter(isToolCall)) {
+      console.log(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
+      const result = await runTool(tools, call)
+      if (result.result.type === "error") console.log(`[error] ${result.result.value}`)
+      results.push(result)
+    }
+    history.push({ role: "tool", content: results })
+  }
+}</code></pre>
+      <p>
+        Run the compiler and the agent. Both should behave as they did at the end of Part 4:
+      </p>
+<pre class="transcript"><code>$ bun run typecheck
+$ tsc --noEmit
+$ cd playground &amp;&amp; bun ../src/index.ts
+You: List the files here and tell me what is in README.md
+[tool] list_files({"path":"."})
+[tool] read_file({"path":"README.md"})
+Agent: Here's what I found:
+
+**Files in this directory:**
+- `secret-file.txt`
+- `README.md`
+- `notes/` (directory)
+
+**Contents of README.md:**
+```markdown
+# Playground
+
+A scratch folder for testing the agent.
+```</code></pre>
+      <p>
+        The compiler prints nothing. Input that ends still stops this version with <code>readline was closed</code>, as in Part 4, and step 2 addresses it.
+      </p>
+
+      <h3>Step 2: Add Effect, the failure classes and <code>ask</code></h3>
+      <p>
+        Install Effect at the version used here:
+      </p>
+<pre><code>bun add effect@4.1.0</code></pre>
+      <p>
+        Create a new file, <code>src/errors.ts</code>, with the code below. It holds every failure the agent names. Each class lists its fields, and the four tool failures turn them into the sentence the model reads through a <code>message</code> getter.
+        <code>messageOf</code> turns a thrown value into text:
+      </p>
+<pre><code>import { Schema } from "effect"
+
+// Tool failures: each one becomes a tool result the model can read and react to.
+export class UnknownTool extends Schema.TaggedError&lt;UnknownTool&gt;()("UnknownTool", {
+  name: Schema.String,
+  available: Schema.Array(Schema.String),
+}) {
+  override get message() {
+    return `Unknown tool: ${this.name}. Available tools: ${this.available.join(", ")}`
+  }
+}
+
+export class InvalidInput extends Schema.TaggedError&lt;InvalidInput&gt;()("InvalidInput", {
+  tool: Schema.String,
+  problems: Schema.Array(Schema.String),
+  takes: Schema.String,
+}) {
+  override get message() {
+    return [`Invalid input for ${this.tool}:`, ...this.problems.map((problem) =&gt; `- ${problem}`), `${this.tool} takes an object with the fields: ${this.takes}`].join("\n")
+  }
+}
+
+export class Declined extends Schema.TaggedError&lt;Declined&gt;()("Declined", {}) {
+  override get message() {
+    return "User declined this action. Ask what they would like instead."
+  }
+}
+
+export class ToolCrashed extends Schema.TaggedError&lt;ToolCrashed&gt;()("ToolCrashed", {
+  tool: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message() {
+    return this.reason
+  }
+}
+
+// Failures of the model request. The user reads these; the model never sees them.
+export class ProviderError extends Schema.TaggedError&lt;ProviderError&gt;()("ProviderError", {
+  reason: Schema.String,
+}) {
+  override get message() {
+    return this.reason
+  }
+}
+
+// Standard input ended, so there is nobody left to ask.
+export class InputClosed extends Schema.TaggedError&lt;InputClosed&gt;()("InputClosed", {}) {}
+
+export const messageOf = (error: unknown) =&gt; (error instanceof Error ? error.message : String(error))</code></pre>
+      <p>
+        Then replace the contents of <code>src/terminal.ts</code>: the exported <code>rl</code> becomes <code>ask</code>. It needs the extra lines because a question that is pending when input ends never settles.
+        The <code>close</code> event is turned into a rejection, and the question is raced against it, so the failure becomes <code>InputClosed</code> in the type:
+      </p>
+<pre><code>import { Effect } from "effect"
+import { createInterface } from "node:readline/promises"
+import { InputClosed } from "./errors"
+
+const rl = createInterface({ input: process.stdin, output: process.stdout })
+
+// A pending question never settles when input ends, so ending input is turned into a rejection.
+const closed = new Promise&lt;never&gt;((_, reject) =&gt; rl.once("close", () =&gt; reject(new Error("input closed"))))
+closed.catch(() =&gt; {})
+
+// Asks one question. The type says it can fail: input may have ended.
+export const ask = (prompt: string) =&gt;
+  Effect.tryPromise({
+    try: () =&gt; Promise.race([rl.question(prompt), closed]),
+    catch: () =&gt; new InputClosed(),
+  })</code></pre>
+      <p>
+        <code>index.ts</code> and <code>tool.ts</code> still import <code>rl</code>, so the compiler now reports it, once in each file. Steps 3 and 5 replace both files.
+        Check <code>ask</code> by itself with a temporary <code>src/check.ts</code>:
+      </p>
+<pre><code>import { Effect } from "effect"
+import { ask } from "./terminal"
+
+console.log(await Effect.runPromise(Effect.result(ask("Question: "))))</code></pre>
+      <p>
+        <code>Effect.result</code> turns the failure into a value, so the check prints it. With input that ends and with an answer:
+      </p>
+<pre class="transcript"><code>$ cd playground &amp;&amp; : | bun ../src/check.ts
+Question: {
+  _id: "Result",
+  _tag: "Failure",
+  failure: {
+    _tag: "InputClosed",
+  },
+}
+$ echo hello | bun ../src/check.ts
+Question: {
+  _id: "Result",
+  _tag: "Success",
+  value: "hello",
+}</code></pre>
+      <p>
+        Without the race, the first command does not return. Delete <code>check.ts</code> afterwards.
+      </p>
+      <details class="reveal">
+        <summary>Stuck? The finished errors.ts and terminal.ts</summary>
+<p class="where"><code>src/errors.ts</code></p>
+<pre><code>import { Schema } from "effect"
+
+// Tool failures: each one becomes a tool result the model can read and react to.
+export class UnknownTool extends Schema.TaggedError&lt;UnknownTool&gt;()("UnknownTool", {
+  name: Schema.String,
+  available: Schema.Array(Schema.String),
+}) {
+  override get message() {
+    return `Unknown tool: ${this.name}. Available tools: ${this.available.join(", ")}`
+  }
+}
+
+export class InvalidInput extends Schema.TaggedError&lt;InvalidInput&gt;()("InvalidInput", {
+  tool: Schema.String,
+  problems: Schema.Array(Schema.String),
+  takes: Schema.String,
+}) {
+  override get message() {
+    return [`Invalid input for ${this.tool}:`, ...this.problems.map((problem) =&gt; `- ${problem}`), `${this.tool} takes an object with the fields: ${this.takes}`].join("\n")
+  }
+}
+
+export class Declined extends Schema.TaggedError&lt;Declined&gt;()("Declined", {}) {
+  override get message() {
+    return "User declined this action. Ask what they would like instead."
+  }
+}
+
+export class ToolCrashed extends Schema.TaggedError&lt;ToolCrashed&gt;()("ToolCrashed", {
+  tool: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message() {
+    return this.reason
+  }
+}
+
+// Failures of the model request. The user reads these; the model never sees them.
+export class ProviderError extends Schema.TaggedError&lt;ProviderError&gt;()("ProviderError", {
+  reason: Schema.String,
+}) {
+  override get message() {
+    return this.reason
+  }
+}
+
+// Standard input ended, so there is nobody left to ask.
+export class InputClosed extends Schema.TaggedError&lt;InputClosed&gt;()("InputClosed", {}) {}
+
+export const messageOf = (error: unknown) =&gt; (error instanceof Error ? error.message : String(error))</code></pre>
+<p class="where"><code>src/terminal.ts</code></p>
+<pre><code>import { Effect } from "effect"
+import { createInterface } from "node:readline/promises"
+import { InputClosed } from "./errors"
+
+const rl = createInterface({ input: process.stdin, output: process.stdout })
+
+// A pending question never settles when input ends, so ending input is turned into a rejection.
+const closed = new Promise&lt;never&gt;((_, reject) =&gt; rl.once("close", () =&gt; reject(new Error("input closed"))))
+closed.catch(() =&gt; {})
+
+// Asks one question. The type says it can fail: input may have ended.
+export const ask = (prompt: string) =&gt;
+  Effect.tryPromise({
+    try: () =&gt; Promise.race([rl.question(prompt), closed]),
+    catch: () =&gt; new InputClosed(),
+  })</code></pre>
+      </details>
+
+      <h3>Step 3: Rewrite <code>tool.ts</code></h3>
+      <p>
+        This file changes the most. <code>Tool</code> loses <code>execute</code> and <code>confirm</code> and gets <code>run</code>, the JSON Schema is derived instead of written, and <code>field</code> is gone.
+        The first part is the imports, the union of tool failures, the new <code>Tool</code> type and the formatter that turns Schema's problems into the lines of an <code>InvalidInput</code>:
+      </p>
+<pre><code>import { Effect, Schema, SchemaIssue } from "effect"
+import { Declined, InvalidInput, messageOf, ToolCrashed, UnknownTool } from "./errors"
+import type { ToolCallPart, ToolResultPart, ToolResultValue } from "./messages"
+import { ask } from "./terminal"
+
+export type ToolFailure = UnknownTool | InvalidInput | Declined | ToolCrashed
+
+export type Tool = {
+  name: string
+  description: string
+  parameters: Record&lt;string, unknown&gt; // JSON Schema, derived from the input Schema
+  run: (input: unknown) =&gt; Effect.Effect&lt;string, ToolFailure&gt;
+}
+
+const formatIssues = SchemaIssue.makeFormatterStandardSchemaV1()</code></pre>
+      <p>
+        <code>defineTool</code> builds a <code>Tool</code> from a Schema. Its generic parameter <code>S</code> carries the input type to <code>execute</code> and <code>confirm</code>, and
+        <code>DecodingServices: never</code> limits <code>S</code> to Schemas that need nothing else to decode, which is what keeps <code>R</code> at <code>never</code>.
+        <code>takes</code> is the list of field names, <code>decode</code> is the validator, and <code>parameters</code> is the JSON Schema derived from the same Schema.
+      </p>
+      <p>
+        <code>run</code> is an <code>Effect.gen</code> with four steps: reject text that was not JSON, decode the input, ask for confirmation, run the tool.
+        Each <code>return yield* new …</code> stops the generator with that failure, the way a <code>throw</code> would.
+        Three calls bring in errors from outside the agent: <code>mapError</code> turns Schema's error into <code>InvalidInput</code>, <code>orElseSucceed</code> makes an input that ended count as an empty answer,
+        and <code>tryPromise</code> turns a rejected promise into <code>ToolCrashed</code>:
+      </p>
+<pre><code>// Builds a Tool from one Schema: it validates the input and produces the JSON Schema the model receives.
+// `DecodingServices: never` limits S to Schemas that need nothing else to decode, so `run` keeps R = never.
+export const defineTool = &lt;S extends Schema.Struct&lt;Schema.Struct.Fields&gt; &amp; { readonly DecodingServices: never }&gt;(config: {
+  name: string
+  description: string
+  input: S
+  execute: (input: S["Type"]) =&gt; Promise&lt;string&gt;
+  confirm?: (input: S["Type"]) =&gt; string // describes the action; when set, the user must approve it first
+}): Tool =&gt; {
+  const takes = Object.keys(config.input.fields).join(", ")
+  const decode = Schema.decodeUnknownEffect(config.input)
+
+  return {
+    name: config.name,
+    description: config.description,
+    parameters: Schema.toJsonSchemaDocument(config.input).schema,
+    run: (raw) =&gt;
+      Effect.gen(function* () {
+        // A string is arguments that were not valid JSON; the protocol keeps the raw text.
+        if (typeof raw === "string") {
+          return yield* new InvalidInput({ tool: config.name, problems: [`the arguments are not valid JSON: ${raw}`], takes })
+        }
+
+        const input = yield* decode(raw, { errors: "all" }).pipe(
+          Effect.mapError(
+            (error) =&gt;
+              new InvalidInput({
+                tool: config.name,
+                problems: formatIssues(error.issue).issues.map((issue) =&gt; `${issue.path?.join(".") || "input"}: ${issue.message}`),
+                takes,
+              }),
+          ),
+        )
+
+        if (config.confirm) {
+          // No answer counts as "no".
+          const answer = yield* ask(`Allow: ${config.confirm(input)}? [y/N] `).pipe(Effect.orElseSucceed(() =&gt; ""))
+          if (answer.trim().toLowerCase() !== "y") return yield* new Declined()
+        }
+
+        return yield* Effect.tryPromise({
+          try: () =&gt; config.execute(input),
+          catch: (error) =&gt; new ToolCrashed({ tool: config.name, reason: messageOf(error) }),
+        })
+      }),
+  }
+}</code></pre>
+      <p>
+        <code>runTool</code> picks the tool and runs it. <code>Effect.map</code> and <code>Effect.catch</code> turn the two outcomes into the result type from Part 4.
+        A tool name that is not registered fails with <code>UnknownTool</code> before reaching them:
+      </p>
+<pre><code>// Cannot fail: every tool failure becomes a tool result the model can read.
+export const runTool = (tools: Tool[], call: ToolCallPart): Effect.Effect&lt;ToolResultPart&gt; =&gt; {
+  const done = (result: ToolResultValue): ToolResultPart =&gt; ({ type: "tool-result", id: call.id, name: call.name, result })
+  const tool = tools.find((tool) =&gt; tool.name === call.name)
+  const run = tool ? tool.run(call.input) : Effect.fail(new UnknownTool({ name: call.name, available: tools.map((tool) =&gt; tool.name) }))
+
+  return run.pipe(
+    Effect.map((value) =&gt; done({ type: "text", value })),
+    Effect.catch((failure) =&gt; Effect.succeed(done({ type: "error", value: failure.message }))),
+  )
+}</code></pre>
+      <p>
+        <code>tools.ts</code> and <code>index.ts</code> use the old shape, so the compiler reports them. The messages are the compiler's list of what is left to change. In <code>tools.ts</code> every tool still has an <code>execute</code> and an <code>input</code> parameter without a type,
+        and <code>index.ts</code> treats the result of <code>runTool</code> as a plain value:
+      </p>
+<pre class="transcript"><code>$ bunx --package typescript tsc --noEmit
+src/index.ts(3,10): error TS2459: Module '"./terminal"' declares 'rl' locally, but it is not exported.
+src/index.ts(25,18): error TS2339: Property 'result' does not exist on type 'Effect&lt;ToolResultPart, never, never&gt;'.
+src/tools.ts(5,10): error TS2305: Module '"./tool"' has no exported member 'field'.
+src/tools.ts(63,5): error TS2353: Object literal may only specify known properties, and 'execute' does not exist in type 'Tool'.
+src/tools.ts(63,15): error TS7006: Parameter 'input' implicitly has an 'any' type.
+…</code></pre>
+      <p>
+        Before changing them, check <code>tool.ts</code> with a tool defined inside a temporary <code>check.ts</code>. It runs six calls, one for each way a call can go wrong or right:
+      </p>
+<pre><code>import { Effect, Schema } from "effect"
+import { readFile } from "node:fs/promises"
+import { defineTool, runTool } from "./tool"
+
+const readTool = defineTool({
+  name: "read_file",
+  description: "Read the full text contents of a file.",
+  input: Schema.Struct({ path: Schema.String }),
+  execute: ({ path }) =&gt; readFile(path, "utf8"),
+})
+
+const call = (name: string, input: unknown) =&gt; ({ type: "tool-call" as const, id: "test", name, input })
+const calls: [string, unknown][] = [
+  ["delete_everything", {}],
+  ["read_file", '{"path": '],
+  ["read_file", {}],
+  ["read_file", { path: 42 }],
+  ["read_file", { path: "missing.txt" }],
+  ["read_file", { path: "README.md" }],
+]
+for (const [name, input] of calls) {
+  const { result } = await Effect.runPromise(runTool([readTool], call(name, input)))
+  console.log(`${name} ${JSON.stringify(input)}\n${result.type}: ${result.value}\n`)
+}
+process.exit(0)</code></pre>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../src/check.ts
+delete_everything {}
+error: Unknown tool: delete_everything. Available tools: read_file
+
+read_file "{\"path\": "
+error: Invalid input for read_file:
+- the arguments are not valid JSON: {"path":
+read_file takes an object with the fields: path
+
+read_file {}
+error: Invalid input for read_file:
+- path: Missing key
+read_file takes an object with the fields: path
+
+read_file {"path":42}
+error: Invalid input for read_file:
+- path: Expected string
+read_file takes an object with the fields: path
+
+read_file {"path":"missing.txt"}
+error: ENOENT: no such file or directory, open 'missing.txt'
+
+read_file {"path":"README.md"}
+text: # Playground
+
+A scratch folder for testing the agent.</code></pre>
+      <p>
+        Five failures and one success, each a value with its call's id, as in Part 4. The first is an <code>UnknownTool</code>, the next three are <code>InvalidInput</code>, and the file error is a <code>ToolCrashed</code> whose message is the original one.
+        <code>Declined</code> needs a tool with a <code>confirm</code> function, which arrives with the real tools in step 4, and step 6 declines one. The call with the string <code>'{"path": '</code> is how a protocol hands over arguments it could not parse. Delete <code>check.ts</code> afterwards.
+      </p>
+      <details class="reveal">
+        <summary>Stuck? The finished tool.ts</summary>
+<p class="where"><code>src/tool.ts</code></p>
+<pre><code>import { Effect, Schema, SchemaIssue } from "effect"
+import { Declined, InvalidInput, messageOf, ToolCrashed, UnknownTool } from "./errors"
+import type { ToolCallPart, ToolResultPart, ToolResultValue } from "./messages"
+import { ask } from "./terminal"
+
+export type ToolFailure = UnknownTool | InvalidInput | Declined | ToolCrashed
+
+export type Tool = {
+  name: string
+  description: string
+  parameters: Record&lt;string, unknown&gt; // JSON Schema, derived from the input Schema
+  run: (input: unknown) =&gt; Effect.Effect&lt;string, ToolFailure&gt;
+}
+
+const formatIssues = SchemaIssue.makeFormatterStandardSchemaV1()
+
+// Builds a Tool from one Schema: it validates the input and produces the JSON Schema the model receives.
+// `DecodingServices: never` limits S to Schemas that need nothing else to decode, so `run` keeps R = never.
+export const defineTool = &lt;S extends Schema.Struct&lt;Schema.Struct.Fields&gt; &amp; { readonly DecodingServices: never }&gt;(config: {
+  name: string
+  description: string
+  input: S
+  execute: (input: S["Type"]) =&gt; Promise&lt;string&gt;
+  confirm?: (input: S["Type"]) =&gt; string // describes the action; when set, the user must approve it first
+}): Tool =&gt; {
+  const takes = Object.keys(config.input.fields).join(", ")
+  const decode = Schema.decodeUnknownEffect(config.input)
+
+  return {
+    name: config.name,
+    description: config.description,
+    parameters: Schema.toJsonSchemaDocument(config.input).schema,
+    run: (raw) =&gt;
+      Effect.gen(function* () {
+        // A string is arguments that were not valid JSON; the protocol keeps the raw text.
+        if (typeof raw === "string") {
+          return yield* new InvalidInput({ tool: config.name, problems: [`the arguments are not valid JSON: ${raw}`], takes })
+        }
+
+        const input = yield* decode(raw, { errors: "all" }).pipe(
+          Effect.mapError(
+            (error) =&gt;
+              new InvalidInput({
+                tool: config.name,
+                problems: formatIssues(error.issue).issues.map((issue) =&gt; `${issue.path?.join(".") || "input"}: ${issue.message}`),
+                takes,
+              }),
+          ),
+        )
+
+        if (config.confirm) {
+          // No answer counts as "no".
+          const answer = yield* ask(`Allow: ${config.confirm(input)}? [y/N] `).pipe(Effect.orElseSucceed(() =&gt; ""))
+          if (answer.trim().toLowerCase() !== "y") return yield* new Declined()
+        }
+
+        return yield* Effect.tryPromise({
+          try: () =&gt; config.execute(input),
+          catch: (error) =&gt; new ToolCrashed({ tool: config.name, reason: messageOf(error) }),
+        })
+      }),
+  }
+}
+
+// Cannot fail: every tool failure becomes a tool result the model can read.
+export const runTool = (tools: Tool[], call: ToolCallPart): Effect.Effect&lt;ToolResultPart&gt; =&gt; {
+  const done = (result: ToolResultValue): ToolResultPart =&gt; ({ type: "tool-result", id: call.id, name: call.name, result })
+  const tool = tools.find((tool) =&gt; tool.name === call.name)
+  const run = tool ? tool.run(call.input) : Effect.fail(new UnknownTool({ name: call.name, available: tools.map((tool) =&gt; tool.name) }))
+
+  return run.pipe(
+    Effect.map((value) =&gt; done({ type: "text", value })),
+    Effect.catch((failure) =&gt; Effect.succeed(done({ type: "error", value: failure.message }))),
+  )
+}</code></pre>
+      </details>
+
+      <h3>Step 4: Declare the tools with Schemas</h3>
+      <p>
+        In <code>tools.ts</code>, change the imports at the top. <code>field</code> is gone, and <code>Schema</code> and <code>defineTool</code> come in:
+      </p>
+<pre><code>import { execFile } from "node:child_process"
+import { existsSync } from "node:fs"
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises"
+import { dirname } from "node:path"
+import { Schema } from "effect"
+import { defineTool, type Tool } from "./tool"</code></pre>
+      <p>
+        The helpers (<code>listFiles</code>, <code>editFile</code>, <code>saveFile</code>, <code>runBash</code>) stay as they are. Their names, descriptions and bodies are the same as in Part 4.
+        What changes is how the model's input is described: each tool's hand-written <code>parameters</code> object and its <code>field()</code> calls are replaced by one <code>Schema.Struct</code>, and <code>execute</code> receives the decoded fields.
+        Replace the whole <code>export const tools: Tool[] = [ … ]</code> array with:
+      </p>
+<pre><code>export const tools: Tool[] = [
+  defineTool({
+    name: "list_files",
+    description:
+      "List the files and directories at a path. Directory names end with a slash. Use it whenever you need to know what exists. Pass '.' for the current directory.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Directory to list, e.g. '.' or 'notes'" }),
+    }),
+    execute: ({ path }) =&gt; listFiles(path),
+  }),
+  defineTool({
+    name: "read_file",
+    description:
+      "Read the full text contents of a file. Use it when you need to see what is inside a file. Do not use it on directories; use list_files for those.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Path of the file to read, e.g. 'README.md'" }),
+    }),
+    execute: ({ path }) =&gt; readFile(path, "utf8"),
+  }),
+  defineTool({
+    name: "edit_file",
+    description:
+      "Edit a text file by replacing old_str with new_str. old_str must match exactly one place in the file, character for character, including whitespace, so read the file first and copy it. To create a new file, use a path that does not exist and set old_str to an empty string; new_str becomes the whole file.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Path of the file to edit or create" }),
+      old_str: Schema.String.annotate({ description: "Text to replace. Empty to create a new file." }),
+      new_str: Schema.String.annotate({ description: "Text to put in its place" }),
+    }),
+    execute: ({ path, old_str, new_str }) =&gt; editFile(path, old_str, new_str),
+    confirm: ({ path }) =&gt; `edit ${path}`,
+  }),
+  defineTool({
+    name: "write_file",
+    description:
+      "Write a complete text file, replacing it if it already exists and creating missing folders. Use it to create a new file or to rewrite a file entirely. For a small change to an existing file, use edit_file instead, because it sends only the part that changes. The content you pass becomes the whole file.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Path of the file to write, e.g. 'notes/plan.md'" }),
+      content: Schema.String.annotate({ description: "The full text of the file" }),
+    }),
+    execute: ({ path, content }) =&gt; saveFile(path, content),
+    confirm: ({ path }) =&gt; `write ${path}`,
+  }),
+  defineTool({
+    name: "bash",
+    description:
+      "Run a shell command with bash in the current directory and return its output and exit code. Use it for things the other tools cannot do, such as running a script, a test or git. Commands stop after 30 seconds and long output is cut off, so filter it with head, tail or grep when you expect a lot. Prefer read_file and list_files for reading, because they are cheaper and safer.",
+    input: Schema.Struct({
+      command: Schema.String.annotate({ description: "The command to run, e.g. 'ls -la' or 'bun test'" }),
+    }),
+    execute: ({ command }) =&gt; runBash(command),
+    confirm: ({ command }) =&gt; `run: ${command}`,
+  }),
+]</code></pre>
+      <p>
+        Each field's <code>description</code> is an annotation on its Schema and ends up in the JSON Schema, which is the text the model sees about that argument.
+        Print the result for <code>edit_file</code> with a temporary <code>check.ts</code>:
+      </p>
+<pre><code>import { tools } from "./tools"
+
+console.log(JSON.stringify(tools.find((tool) =&gt; tool.name === "edit_file")?.parameters, null, 2))
+process.exit(0)</code></pre>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../src/check.ts
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Path of the file to edit or create"
+    },
+    "old_str": {
+      "type": "string",
+      "description": "Text to replace. Empty to create a new file."
+    },
+    "new_str": {
+      "type": "string",
+      "description": "Text to put in its place"
+    }
+  },
+  "required": [
+    "path",
+    "old_str",
+    "new_str"
+  ],
+  "additionalProperties": true
+}</code></pre>
+      <p>
+        This matches the object written by hand in Part 4, with one addition: <code>additionalProperties: true</code>, which is Schema's default. Ollama and llama.cpp accepted it in the runs below.
+        Only <code>index.ts</code> is left with compiler errors. Delete <code>check.ts</code>.
+      </p>
+      <details class="reveal">
+        <summary>Stuck? The finished tools.ts</summary>
+<p class="where"><code>src/tools.ts</code></p>
+<pre><code>import { execFile } from "node:child_process"
+import { existsSync } from "node:fs"
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises"
+import { dirname } from "node:path"
+import { Schema } from "effect"
+import { defineTool, type Tool } from "./tool"
+
+const listFiles = async (path: string) =&gt; {
+  const entries = await readdir(path, { withFileTypes: true })
+  return entries.map((entry) =&gt; (entry.isDirectory() ? `${entry.name}/` : entry.name)).join("\n")
+}
+
+const editFile = async (path: string, oldStr: string, newStr: string) =&gt; {
+  if (oldStr === newStr) throw new Error("old_str and new_str must be different")
+
+  if (oldStr === "") {
+    if (existsSync(path)) throw new Error(`${path} already exists; pass the text to replace as old_str`)
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, newStr)
+    return `Created ${path}`
+  }
+
+  const content = await readFile(path, "utf8")
+  const matches = content.split(oldStr).length - 1
+  if (matches === 0) throw new Error(`old_str was not found in ${path}`)
+  if (matches &gt; 1) throw new Error(`old_str matches ${matches} places in ${path}; include more surrounding text`)
+  await writeFile(path, content.replace(oldStr, () =&gt; newStr))
+  return "OK"
+}
+
+const saveFile = async (path: string, content: string) =&gt; {
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, content)
+  return `Wrote ${content.length} characters to ${path}`
+}
+
+const TIMEOUT_MS = 30_000
+const MAX_OUTPUT = 10_000
+
+const runBash = (command: string) =&gt;
+  new Promise&lt;string&gt;((resolve, reject) =&gt; {
+    execFile("bash", ["-c", command], { timeout: TIMEOUT_MS, maxBuffer: 10_000_000 }, (error, stdout, stderr) =&gt; {
+      if (error?.killed) return reject(new Error(`The command ran longer than ${TIMEOUT_MS} ms and was stopped. Try a faster command.`))
+      if (error &amp;&amp; typeof error.code !== "number") return reject(error)
+      const output = `${stdout}${stderr}`
+      const shown =
+        output.length &gt; MAX_OUTPUT
+          ? `${output.slice(0, MAX_OUTPUT)}\n[Output truncated after ${MAX_OUTPUT} characters. Filter it with head, tail or grep.]`
+          : output
+      resolve(`Exit code: ${error ? error.code : 0}\n${shown}`)
+    })
+  })
+
+export const tools: Tool[] = [
+  defineTool({
+    name: "list_files",
+    description:
+      "List the files and directories at a path. Directory names end with a slash. Use it whenever you need to know what exists. Pass '.' for the current directory.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Directory to list, e.g. '.' or 'notes'" }),
+    }),
+    execute: ({ path }) =&gt; listFiles(path),
+  }),
+  defineTool({
+    name: "read_file",
+    description:
+      "Read the full text contents of a file. Use it when you need to see what is inside a file. Do not use it on directories; use list_files for those.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Path of the file to read, e.g. 'README.md'" }),
+    }),
+    execute: ({ path }) =&gt; readFile(path, "utf8"),
+  }),
+  defineTool({
+    name: "edit_file",
+    description:
+      "Edit a text file by replacing old_str with new_str. old_str must match exactly one place in the file, character for character, including whitespace, so read the file first and copy it. To create a new file, use a path that does not exist and set old_str to an empty string; new_str becomes the whole file.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Path of the file to edit or create" }),
+      old_str: Schema.String.annotate({ description: "Text to replace. Empty to create a new file." }),
+      new_str: Schema.String.annotate({ description: "Text to put in its place" }),
+    }),
+    execute: ({ path, old_str, new_str }) =&gt; editFile(path, old_str, new_str),
+    confirm: ({ path }) =&gt; `edit ${path}`,
+  }),
+  defineTool({
+    name: "write_file",
+    description:
+      "Write a complete text file, replacing it if it already exists and creating missing folders. Use it to create a new file or to rewrite a file entirely. For a small change to an existing file, use edit_file instead, because it sends only the part that changes. The content you pass becomes the whole file.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Path of the file to write, e.g. 'notes/plan.md'" }),
+      content: Schema.String.annotate({ description: "The full text of the file" }),
+    }),
+    execute: ({ path, content }) =&gt; saveFile(path, content),
+    confirm: ({ path }) =&gt; `write ${path}`,
+  }),
+  defineTool({
+    name: "bash",
+    description:
+      "Run a shell command with bash in the current directory and return its output and exit code. Use it for things the other tools cannot do, such as running a script, a test or git. Commands stop after 30 seconds and long output is cut off, so filter it with head, tail or grep when you expect a lot. Prefer read_file and list_files for reading, because they are cheaper and safer.",
+    input: Schema.Struct({
+      command: Schema.String.annotate({ description: "The command to run, e.g. 'ls -la' or 'bun test'" }),
+    }),
+    execute: ({ command }) =&gt; runBash(command),
+    confirm: ({ command }) =&gt; `run: ${command}`,
+  }),
+]</code></pre>
+      </details>
+
+      <h3>Step 5: Make <code>chat</code> and the loop Effects</h3>
+      <p>
+        In <code>provider.ts</code>, replace <code>chat</code>. It was a <code>Promise</code> that threw. It is now an Effect that fails with <code>ProviderError</code>, and it does the request in three steps so each failure has its own message:
+        reaching the server, reading the body, and decoding the reply. A non-2xx status is also a <code>ProviderError</code>, with the status and body in the text. Add the two imports at the top of the file:
+      </p>
+<pre><code>import { Effect } from "effect"
+import { messageOf, ProviderError } from "./errors"
+import type { Message } from "./messages"
+import { anthropicMessages, openaiChat, type Protocol, type Reply } from "./protocols"
+import type { Tool } from "./tool"</code></pre>
+      <p>
+        and replace <code>chat</code> at the end of the file with:
+      </p>
+<pre><code>// One step: one model call. It fails with a ProviderError that the user reads; the model never sees it.
+export const chat = (history: Message[], tools: Tool[]) =&gt;
+  Effect.gen(function* () {
+    const unreachable = (error: unknown) =&gt; new ProviderError({ reason: `Could not reach ${route.baseUrl}: ${messageOf(error)}` })
+
+    const response = yield* Effect.tryPromise({
+      try: () =&gt;
+        fetch(`${route.baseUrl}${route.protocol.path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...route.headers },
+          body: JSON.stringify(route.protocol.body(route.model, history, tools)),
+        }),
+      catch: unreachable,
+    })
+    const text = yield* Effect.tryPromise({ try: () =&gt; response.text(), catch: unreachable })
+    if (!response.ok) return yield* new ProviderError({ reason: `${route.baseUrl} answered ${response.status}: ${text}` })
+
+    return yield* Effect.try({
+      try: (): Reply =&gt; route.protocol.decode(JSON.parse(text)),
+      catch: (error) =&gt; new ProviderError({ reason: `Could not read the reply from ${route.baseUrl}: ${messageOf(error)}` }),
+    })
+  })</code></pre>
+      <p>
+        <code>index.ts</code> splits into <code>turn</code>, which runs one prompt, and <code>program</code>, which reads prompts until input ends. <code>turn</code> is the Part 4 loop with <code>yield*</code> where it had <code>await</code>:
+      </p>
+<pre><code>import { Effect } from "effect"
+import { messageOf } from "./errors"
+import { isToolCall, type Message, type ToolResultPart } from "./messages"
+import { chat } from "./provider"
+import { ask } from "./terminal"
+import { runTool } from "./tool"
+import { tools } from "./tools"
+
+const history: Message[] = []
+
+// One prompt: call the model until it stops asking for tools.
+const turn = (input: string) =&gt;
+  Effect.gen(function* () {
+    history.push({ role: "user", content: [{ type: "text", text: input }] })
+
+    while (true) {
+      const { message, finish } = yield* chat(history, tools)
+      history.push(message)
+      for (const part of message.content) {
+        if (part.type === "text" &amp;&amp; part.text) console.log(`Agent: ${part.text}`)
+      }
+      if (finish !== "tool-calls") return
+
+      const results: ToolResultPart[] = []
+      for (const call of message.content.filter(isToolCall)) {
+        console.log(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
+        const result = yield* runTool(tools, call)
+        if (result.result.type === "error") console.log(`[error] ${result.result.value}`)
+        results.push(result)
+      }
+      history.push({ role: "tool", content: results })
+    }
+  })</code></pre>
+      <p>
+        <code>program</code> asks for a prompt, remembers how long the history is, and runs the turn with both handlers attached. <code>drop</code> cuts the history back and prints the reason.
+        The last <code>catchTag</code> ends the program when input ends, and <code>Effect.runPromise</code> runs it once:
+      </p>
+<pre><code>const program = Effect.gen(function* () {
+  while (true) {
+    const input = yield* ask("You: ")
+
+    // A turn that fails is dropped from the history, so the next prompt starts from a consistent conversation.
+    const before = history.length
+    const drop = (label: string, reason: string) =&gt;
+      Effect.sync(() =&gt; {
+        history.length = before
+        console.log(`[${label}] ${reason}`)
+      })
+
+    yield* turn(input).pipe(
+      Effect.catchTag("ProviderError", (error) =&gt; drop("provider error", error.message)),
+      Effect.catchDefect((defect) =&gt; drop("bug", messageOf(defect))),
+    )
+  }
+}).pipe(Effect.catchTag("InputClosed", () =&gt; Effect.void))
+
+await Effect.runPromise(program)</code></pre>
+      <p>
+        Run it. The first prompt names a file that does not exist, and the second makes the agent write one:
+      </p>
+<pre class="transcript"><code>$ bun run typecheck
+$ tsc --noEmit
+$ cd playground &amp;&amp; bun ../src/index.ts
+You: Read notes/missing.txt and tell me what it says.
+[tool] read_file({"path":"notes/missing.txt"})
+[error] ENOENT: no such file or directory, open 'notes/missing.txt'
+Agent: It seems the file `notes/missing.txt` doesn't exist in the current directory. Would you like me to check if the `notes` directory exists or list its contents?
+You: Create a file notes/hello.txt that contains the word hi.
+[tool] write_file({"path":"notes/hello.txt","content":"hi"})
+Allow: write notes/hello.txt? [y/N] y
+Agent: I've created the file `notes/hello.txt` containing the word "hi".
+You: ^D</code></pre>
+      <p>
+        The compiler is clean, and the output has the same shape as in Part 4. Ctrl-D at the prompt now ends the program instead of raising an error.
+        Run <code>sh reset-playground.sh</code> to remove <code>notes/hello.txt</code>.
+      </p>
+      <details class="reveal">
+        <summary>Stuck? The finished provider.ts and index.ts</summary>
+<p class="where"><code>src/provider.ts</code></p>
+<pre><code>import { Effect } from "effect"
+import { messageOf, ProviderError } from "./errors"
+import type { Message } from "./messages"
+import { anthropicMessages, openaiChat, type Protocol, type Reply } from "./protocols"
+import type { Tool } from "./tool"
+
+// A route binds a protocol to one provider's endpoint and authentication.
+export type Route = { protocol: Protocol; baseUrl: string; headers: Record&lt;string, string&gt;; model: string }
+
+const routes: Record&lt;string, Route&gt; = {
+  ollama: { protocol: openaiChat, baseUrl: "http://127.0.0.1:11434/v1", headers: {}, model: "qwen3.5:9b" },
+  llamacpp: { protocol: openaiChat, baseUrl: "http://127.0.0.1:9931/v1", headers: {}, model: "qwen3.5:9b" },
+  claude: {
+    protocol: anthropicMessages,
+    baseUrl: "https://api.anthropic.com",
+    headers: { "x-api-key": process.env.ANTHROPIC_API_KEY ?? "", "anthropic-version": "2026-10-21" },
+    model: "claude-sonnet-5-5",
+  },
+}
+
+const providerName = process.env.PROVIDER ?? "ollama"
+const selected = routes[providerName]
+if (!selected) throw new Error(`Unknown PROVIDER "${providerName}". Choose one of: ${Object.keys(routes).join(", ")}`)
+if (providerName === "claude" &amp;&amp; !process.env.ANTHROPIC_API_KEY) throw new Error("Set ANTHROPIC_API_KEY first")
+
+// BASE_URL and MODEL still override the route's defaults.
+const route: Route = {
+  ...selected,
+  baseUrl: process.env.BASE_URL ?? selected.baseUrl,
+  model: process.env.MODEL ?? selected.model,
+}
+
+// One step: one model call. It fails with a ProviderError that the user reads; the model never sees it.
+export const chat = (history: Message[], tools: Tool[]) =&gt;
+  Effect.gen(function* () {
+    const unreachable = (error: unknown) =&gt; new ProviderError({ reason: `Could not reach ${route.baseUrl}: ${messageOf(error)}` })
+
+    const response = yield* Effect.tryPromise({
+      try: () =&gt;
+        fetch(`${route.baseUrl}${route.protocol.path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...route.headers },
+          body: JSON.stringify(route.protocol.body(route.model, history, tools)),
+        }),
+      catch: unreachable,
+    })
+    const text = yield* Effect.tryPromise({ try: () =&gt; response.text(), catch: unreachable })
+    if (!response.ok) return yield* new ProviderError({ reason: `${route.baseUrl} answered ${response.status}: ${text}` })
+
+    return yield* Effect.try({
+      try: (): Reply =&gt; route.protocol.decode(JSON.parse(text)),
+      catch: (error) =&gt; new ProviderError({ reason: `Could not read the reply from ${route.baseUrl}: ${messageOf(error)}` }),
+    })
+  })</code></pre>
+<p class="where"><code>src/index.ts</code></p>
+<pre><code>import { Effect } from "effect"
+import { messageOf } from "./errors"
+import { isToolCall, type Message, type ToolResultPart } from "./messages"
+import { chat } from "./provider"
+import { ask } from "./terminal"
+import { runTool } from "./tool"
+import { tools } from "./tools"
+
+const history: Message[] = []
+
+// One prompt: call the model until it stops asking for tools.
+const turn = (input: string) =&gt;
+  Effect.gen(function* () {
+    history.push({ role: "user", content: [{ type: "text", text: input }] })
+
+    while (true) {
+      const { message, finish } = yield* chat(history, tools)
+      history.push(message)
+      for (const part of message.content) {
+        if (part.type === "text" &amp;&amp; part.text) console.log(`Agent: ${part.text}`)
+      }
+      if (finish !== "tool-calls") return
+
+      const results: ToolResultPart[] = []
+      for (const call of message.content.filter(isToolCall)) {
+        console.log(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
+        const result = yield* runTool(tools, call)
+        if (result.result.type === "error") console.log(`[error] ${result.result.value}`)
+        results.push(result)
+      }
+      history.push({ role: "tool", content: results })
+    }
+  })
+
+const program = Effect.gen(function* () {
+  while (true) {
+    const input = yield* ask("You: ")
+
+    // A turn that fails is dropped from the history, so the next prompt starts from a consistent conversation.
+    const before = history.length
+    const drop = (label: string, reason: string) =&gt;
+      Effect.sync(() =&gt; {
+        history.length = before
+        console.log(`[${label}] ${reason}`)
+      })
+
+    yield* turn(input).pipe(
+      Effect.catchTag("ProviderError", (error) =&gt; drop("provider error", error.message)),
+      Effect.catchDefect((defect) =&gt; drop("bug", messageOf(defect))),
+    )
+  }
+}).pipe(Effect.catchTag("InputClosed", () =&gt; Effect.void))
+
+await Effect.runPromise(program)</code></pre>
+      </details>
+
+      <h3>Step 6: Make each kind of failure happen</h3>
+      <p>
+        The point of the rewrite is what happens when something goes wrong, so this step causes each failure on purpose.
+      </p>
+      <p>
+        <strong>A tool failure the model corrects.</strong> To see the message in use, ask the model for an invalid call:
+      </p>
+<pre class="transcript"><code>You: To test your validation, call read_file with no arguments at all (an empty object). After you see the result, fix the call so it reads README.md and tell me what it contains.
+Agent: I'll first attempt to call `read_file` with an empty object to see the error/result, and then correct it to read README.md.
+[tool] read_file({})
+[error] Invalid input for read_file:
+- path: Missing key
+read_file takes an object with the fields: path
+Agent: Good, now I can see the error message. Let me call it correctly with the proper `path` parameter to read README.md.
+[tool] read_file({"path":"README.md"})
+Agent: Perfect! I was able to read README.md successfully. Here's what it contains:
+
+```markdown
+# Playground
+
+A scratch folder for testing the agent.
+```</code></pre>
+      <p>
+        The model read the message, named the missing field and sent the next call with it. This was one run; the prompt asked for the invalid call, so it shows the message being usable and does not measure how often a model recovers.
+      </p>
+      <p>
+        <strong>A declined action.</strong> Answer <code>n</code> at a confirmation prompt. The refusal goes back to the model as a result, and the model reacts to it:
+      </p>
+<pre class="transcript"><code>You: Use your bash tool to run the command: echo hi
+[tool] bash({"command":"echo hi"})
+Allow: run: echo hi? [y/N] n
+[error] User declined this action. Ask what they would like instead.
+Agent: It seems the user declined the previous action. Would you like to run a different command or perform another task?
+You: ^D</code></pre>
+      <p>
+        <strong>Provider errors.</strong> Point the agent at a port with no server and at a model name the server does not have. Each message is printed and the prompt returns:
+      </p>
+<pre class="transcript"><code>$ cd playground &amp;&amp; BASE_URL=http://127.0.0.1:9/v1 bun ../src/index.ts
+You: hello
+[provider error] Could not reach http://127.0.0.1:9/v1: ECONNREFUSED: Unable to connect. Is the computer able to access the url?
+You: ^D
+
+$ cd playground &amp;&amp; MODEL=no-such-model bun ../src/index.ts
+You: hello
+[provider error] http://127.0.0.1:11434/v1 answered 404: {"error":{"message":"model 'no-such-model' not found","type":"not_found_error","param":null,"code":null}}
+You: ^D</code></pre>
+      <p>
+        <strong>A dropped turn.</strong> A stand-in server that answers with a tool call, then with an error, then with a normal reply shows what the history looks like after a failure.
+        It prints the roles of the messages it receives. Save it as <code>src/stub.ts</code>:
+      </p>
+<pre><code>let requests = 0
+
+Bun.serve({
+  port: 9955,
+  async fetch(req) {
+    const body = (await req.json()) as { messages: { role: string }[] }
+    requests++
+    console.error(`request ${requests}: roles = ${body.messages.map((message) =&gt; message.role).join(",")}`)
+    if (requests === 1) {
+      return Response.json({ choices: [{ message: { content: null, tool_calls: [{ id: "c1", function: { name: "list_files", arguments: '{"path":"."}' } }] } }] })
+    }
+    if (requests === 2) return new Response("upstream exploded", { status: 500 })
+    return Response.json({ choices: [{ message: { content: "all good now" } }] })
+  },
+})</code></pre>
+      <p>
+        Run <code>bun ../src/stub.ts</code> in one terminal and the agent in another, with <code>BASE_URL=http://127.0.0.1:9955/v1</code>, and enter <code>first</code> and then <code>second</code>:
+      </p>
+<pre class="transcript"><code>agent terminal:
+You: first
+[tool] list_files({"path":"."})
+[provider error] http://127.0.0.1:9955/v1 answered 500: upstream exploded
+You: second
+Agent: all good now
+You: ^D
+
+stub terminal:
+request 1: roles = user
+request 2: roles = user,assistant,tool
+request 3: roles = user</code></pre>
+      <p>
+        Request 2 carries the tool result. Request 3 contains only the new prompt, so the failed turn, including its tool call, is gone from the history.
+      </p>
+      <p>
+        <strong>A defect.</strong> Temporarily add a <code>confirm</code> that throws to the <code>list_files</code> entry in <code>tools.ts</code>, and run the same stand-in:
+      </p>
+<pre><code>confirm: ({ path }) =&gt; {
+  throw new Error(`bug: could not describe ${path}`)
+},</code></pre>
+<pre class="transcript"><code>agent terminal:
+You: first
+[tool] list_files({"path":"."})
+[bug] bug: could not describe .
+You: second
+[provider error] http://127.0.0.1:9955/v1 answered 500: upstream exploded
+You: ^D
+
+stub terminal (restarted before this run):
+request 1: roles = user
+request 2: roles = user</code></pre>
+      <p>
+        The bug is printed for the author with a <code>[bug]</code> label and is not sent to the model, and the turn is dropped: the stand-in's second request, which belongs to the prompt <code>second</code>, carries only that prompt.
+        The 500 on that request comes from the stand-in, which answers its second request with an error. In Part 4 the same mistake would have come back as a tool result. Remove the temporary <code>confirm</code> and <code>stub.ts</code> afterwards.
+      </p>
+      <p>
+        <strong>llama.cpp.</strong> The same files run on the second local provider by changing the route. Start the server with <code>--reasoning off</code> and choose it with <code>PROVIDER</code>:
+      </p>
+<pre class="transcript"><code>$ cd playground &amp;&amp; PROVIDER=llamacpp bun ../src/index.ts
+You: Read notes/missing.txt and tell me what it says.
+[tool] read_file({"path":"notes/missing.txt"})
+[error] ENOENT: no such file or directory, open 'notes/missing.txt'
+Agent: The file `notes/missing.txt` does not exist.
+
+Would you like me to check if the `notes` directory exists and what files are in it?
+
+
+[tool] list_files({"path":"notes"})
+Agent: The `notes` directory exists but only contains `todo.txt`. The file `missing.txt` is not there.
+
+Did you perhaps mean `todo.txt`?</code></pre>
+      <p>
+        <code>PROVIDER=claude</code> still selects the Anthropic route. This part did not change the protocols and was not run against the live Claude API.
+      </p>
+
+      <div class="callout">
+        <span class="callout-label">Watch for this</span>
+        <code>Effect.catch</code> and <code>catchTag</code> handle typed failures only. A bug that throws is a defect, and the typed handler next to it does not run for it.
+        When a handler seems to be ignored, check which of the two kinds of failure reached it.
+      </div>
+      <div class="callout">
+        <span class="callout-label">Result</span>
+        Every function that can fail says so in its type. The model reads tool failures, the user reads provider errors and bugs, and a failed turn leaves the history valid.
+        Adding a tool is one <code>defineTool</code> entry, and adding a route or a protocol touches neither the tools nor the loop.
+      </div>
+
+      <h3 id="finished-files">The finished files</h3>
+      <p>
+        These eight files in <code>src</code> are the whole implementation. <code>protocols.ts</code> and <code>messages.ts</code> are as step 1 left them.
+      </p>
+      <details class="reveal">
+        <summary>src/messages.ts</summary>
+<pre><code>// The agent's own message types. No protocol appears in them.
+export type TextPart = { type: "text"; text: string }
+export type ToolCallPart = { type: "tool-call"; id: string; name: string; input: unknown }
+export type ToolResultValue = { type: "text" | "error"; value: string }
+export type ToolResultPart = { type: "tool-result"; id: string; name: string; result: ToolResultValue }
+export type Part = TextPart | ToolCallPart | ToolResultPart
+
+export type Message = {
+  role: "user" | "assistant" | "tool"
+  content: Part[]
+  // The provider's own content for this message, kept so the same protocol can send it back unchanged.
+  native?: unknown
+}
+
+export const isToolCall = (part: Part): part is ToolCallPart =&gt; part.type === "tool-call"
+export const textOf = (message: Message) =&gt; message.content.flatMap((part) =&gt; (part.type === "text" ? [part.text] : [])).join("\n")</code></pre>
+      </details>
+      <details class="reveal">
+        <summary>src/errors.ts</summary>
+<pre><code>import { Schema } from "effect"
+
+// Tool failures: each one becomes a tool result the model can read and react to.
+export class UnknownTool extends Schema.TaggedError&lt;UnknownTool&gt;()("UnknownTool", {
+  name: Schema.String,
+  available: Schema.Array(Schema.String),
+}) {
+  override get message() {
+    return `Unknown tool: ${this.name}. Available tools: ${this.available.join(", ")}`
+  }
+}
+
+export class InvalidInput extends Schema.TaggedError&lt;InvalidInput&gt;()("InvalidInput", {
+  tool: Schema.String,
+  problems: Schema.Array(Schema.String),
+  takes: Schema.String,
+}) {
+  override get message() {
+    return [`Invalid input for ${this.tool}:`, ...this.problems.map((problem) =&gt; `- ${problem}`), `${this.tool} takes an object with the fields: ${this.takes}`].join("\n")
+  }
+}
+
+export class Declined extends Schema.TaggedError&lt;Declined&gt;()("Declined", {}) {
+  override get message() {
+    return "User declined this action. Ask what they would like instead."
+  }
+}
+
+export class ToolCrashed extends Schema.TaggedError&lt;ToolCrashed&gt;()("ToolCrashed", {
+  tool: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message() {
+    return this.reason
+  }
+}
+
+// Failures of the model request. The user reads these; the model never sees them.
+export class ProviderError extends Schema.TaggedError&lt;ProviderError&gt;()("ProviderError", {
+  reason: Schema.String,
+}) {
+  override get message() {
+    return this.reason
+  }
+}
+
+// Standard input ended, so there is nobody left to ask.
+export class InputClosed extends Schema.TaggedError&lt;InputClosed&gt;()("InputClosed", {}) {}
+
+export const messageOf = (error: unknown) =&gt; (error instanceof Error ? error.message : String(error))</code></pre>
+      </details>
+      <details class="reveal">
+        <summary>src/terminal.ts</summary>
+<pre><code>import { Effect } from "effect"
+import { createInterface } from "node:readline/promises"
+import { InputClosed } from "./errors"
+
+const rl = createInterface({ input: process.stdin, output: process.stdout })
+
+// A pending question never settles when input ends, so ending input is turned into a rejection.
+const closed = new Promise&lt;never&gt;((_, reject) =&gt; rl.once("close", () =&gt; reject(new Error("input closed"))))
+closed.catch(() =&gt; {})
+
+// Asks one question. The type says it can fail: input may have ended.
+export const ask = (prompt: string) =&gt;
+  Effect.tryPromise({
+    try: () =&gt; Promise.race([rl.question(prompt), closed]),
+    catch: () =&gt; new InputClosed(),
+  })</code></pre>
+      </details>
+      <details class="reveal">
+        <summary>src/tool.ts</summary>
+<pre><code>import { Effect, Schema, SchemaIssue } from "effect"
+import { Declined, InvalidInput, messageOf, ToolCrashed, UnknownTool } from "./errors"
+import type { ToolCallPart, ToolResultPart, ToolResultValue } from "./messages"
+import { ask } from "./terminal"
+
+export type ToolFailure = UnknownTool | InvalidInput | Declined | ToolCrashed
+
+export type Tool = {
+  name: string
+  description: string
+  parameters: Record&lt;string, unknown&gt; // JSON Schema, derived from the input Schema
+  run: (input: unknown) =&gt; Effect.Effect&lt;string, ToolFailure&gt;
+}
+
+const formatIssues = SchemaIssue.makeFormatterStandardSchemaV1()
+
+// Builds a Tool from one Schema: it validates the input and produces the JSON Schema the model receives.
+// `DecodingServices: never` limits S to Schemas that need nothing else to decode, so `run` keeps R = never.
+export const defineTool = &lt;S extends Schema.Struct&lt;Schema.Struct.Fields&gt; &amp; { readonly DecodingServices: never }&gt;(config: {
+  name: string
+  description: string
+  input: S
+  execute: (input: S["Type"]) =&gt; Promise&lt;string&gt;
+  confirm?: (input: S["Type"]) =&gt; string // describes the action; when set, the user must approve it first
+}): Tool =&gt; {
+  const takes = Object.keys(config.input.fields).join(", ")
+  const decode = Schema.decodeUnknownEffect(config.input)
+
+  return {
+    name: config.name,
+    description: config.description,
+    parameters: Schema.toJsonSchemaDocument(config.input).schema,
+    run: (raw) =&gt;
+      Effect.gen(function* () {
+        // A string is arguments that were not valid JSON; the protocol keeps the raw text.
+        if (typeof raw === "string") {
+          return yield* new InvalidInput({ tool: config.name, problems: [`the arguments are not valid JSON: ${raw}`], takes })
+        }
+
+        const input = yield* decode(raw, { errors: "all" }).pipe(
+          Effect.mapError(
+            (error) =&gt;
+              new InvalidInput({
+                tool: config.name,
+                problems: formatIssues(error.issue).issues.map((issue) =&gt; `${issue.path?.join(".") || "input"}: ${issue.message}`),
+                takes,
+              }),
+          ),
+        )
+
+        if (config.confirm) {
+          // No answer counts as "no".
+          const answer = yield* ask(`Allow: ${config.confirm(input)}? [y/N] `).pipe(Effect.orElseSucceed(() =&gt; ""))
+          if (answer.trim().toLowerCase() !== "y") return yield* new Declined()
+        }
+
+        return yield* Effect.tryPromise({
+          try: () =&gt; config.execute(input),
+          catch: (error) =&gt; new ToolCrashed({ tool: config.name, reason: messageOf(error) }),
+        })
+      }),
+  }
+}
+
+// Cannot fail: every tool failure becomes a tool result the model can read.
+export const runTool = (tools: Tool[], call: ToolCallPart): Effect.Effect&lt;ToolResultPart&gt; =&gt; {
+  const done = (result: ToolResultValue): ToolResultPart =&gt; ({ type: "tool-result", id: call.id, name: call.name, result })
+  const tool = tools.find((tool) =&gt; tool.name === call.name)
+  const run = tool ? tool.run(call.input) : Effect.fail(new UnknownTool({ name: call.name, available: tools.map((tool) =&gt; tool.name) }))
+
+  return run.pipe(
+    Effect.map((value) =&gt; done({ type: "text", value })),
+    Effect.catch((failure) =&gt; Effect.succeed(done({ type: "error", value: failure.message }))),
+  )
+}</code></pre>
+      </details>
+      <details class="reveal">
+        <summary>src/tools.ts</summary>
+<pre><code>import { execFile } from "node:child_process"
+import { existsSync } from "node:fs"
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises"
+import { dirname } from "node:path"
+import { Schema } from "effect"
+import { defineTool, type Tool } from "./tool"
+
+const listFiles = async (path: string) =&gt; {
+  const entries = await readdir(path, { withFileTypes: true })
+  return entries.map((entry) =&gt; (entry.isDirectory() ? `${entry.name}/` : entry.name)).join("\n")
+}
+
+const editFile = async (path: string, oldStr: string, newStr: string) =&gt; {
+  if (oldStr === newStr) throw new Error("old_str and new_str must be different")
+
+  if (oldStr === "") {
+    if (existsSync(path)) throw new Error(`${path} already exists; pass the text to replace as old_str`)
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, newStr)
+    return `Created ${path}`
+  }
+
+  const content = await readFile(path, "utf8")
+  const matches = content.split(oldStr).length - 1
+  if (matches === 0) throw new Error(`old_str was not found in ${path}`)
+  if (matches &gt; 1) throw new Error(`old_str matches ${matches} places in ${path}; include more surrounding text`)
+  await writeFile(path, content.replace(oldStr, () =&gt; newStr))
+  return "OK"
+}
+
+const saveFile = async (path: string, content: string) =&gt; {
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, content)
+  return `Wrote ${content.length} characters to ${path}`
+}
+
+const TIMEOUT_MS = 30_000
+const MAX_OUTPUT = 10_000
+
+const runBash = (command: string) =&gt;
+  new Promise&lt;string&gt;((resolve, reject) =&gt; {
+    execFile("bash", ["-c", command], { timeout: TIMEOUT_MS, maxBuffer: 10_000_000 }, (error, stdout, stderr) =&gt; {
+      if (error?.killed) return reject(new Error(`The command ran longer than ${TIMEOUT_MS} ms and was stopped. Try a faster command.`))
+      if (error &amp;&amp; typeof error.code !== "number") return reject(error)
+      const output = `${stdout}${stderr}`
+      const shown =
+        output.length &gt; MAX_OUTPUT
+          ? `${output.slice(0, MAX_OUTPUT)}\n[Output truncated after ${MAX_OUTPUT} characters. Filter it with head, tail or grep.]`
+          : output
+      resolve(`Exit code: ${error ? error.code : 0}\n${shown}`)
+    })
+  })
+
+export const tools: Tool[] = [
+  defineTool({
+    name: "list_files",
+    description:
+      "List the files and directories at a path. Directory names end with a slash. Use it whenever you need to know what exists. Pass '.' for the current directory.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Directory to list, e.g. '.' or 'notes'" }),
+    }),
+    execute: ({ path }) =&gt; listFiles(path),
+  }),
+  defineTool({
+    name: "read_file",
+    description:
+      "Read the full text contents of a file. Use it when you need to see what is inside a file. Do not use it on directories; use list_files for those.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Path of the file to read, e.g. 'README.md'" }),
+    }),
+    execute: ({ path }) =&gt; readFile(path, "utf8"),
+  }),
+  defineTool({
+    name: "edit_file",
+    description:
+      "Edit a text file by replacing old_str with new_str. old_str must match exactly one place in the file, character for character, including whitespace, so read the file first and copy it. To create a new file, use a path that does not exist and set old_str to an empty string; new_str becomes the whole file.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Path of the file to edit or create" }),
+      old_str: Schema.String.annotate({ description: "Text to replace. Empty to create a new file." }),
+      new_str: Schema.String.annotate({ description: "Text to put in its place" }),
+    }),
+    execute: ({ path, old_str, new_str }) =&gt; editFile(path, old_str, new_str),
+    confirm: ({ path }) =&gt; `edit ${path}`,
+  }),
+  defineTool({
+    name: "write_file",
+    description:
+      "Write a complete text file, replacing it if it already exists and creating missing folders. Use it to create a new file or to rewrite a file entirely. For a small change to an existing file, use edit_file instead, because it sends only the part that changes. The content you pass becomes the whole file.",
+    input: Schema.Struct({
+      path: Schema.String.annotate({ description: "Path of the file to write, e.g. 'notes/plan.md'" }),
+      content: Schema.String.annotate({ description: "The full text of the file" }),
+    }),
+    execute: ({ path, content }) =&gt; saveFile(path, content),
+    confirm: ({ path }) =&gt; `write ${path}`,
+  }),
+  defineTool({
+    name: "bash",
+    description:
+      "Run a shell command with bash in the current directory and return its output and exit code. Use it for things the other tools cannot do, such as running a script, a test or git. Commands stop after 30 seconds and long output is cut off, so filter it with head, tail or grep when you expect a lot. Prefer read_file and list_files for reading, because they are cheaper and safer.",
+    input: Schema.Struct({
+      command: Schema.String.annotate({ description: "The command to run, e.g. 'ls -la' or 'bun test'" }),
+    }),
+    execute: ({ command }) =&gt; runBash(command),
+    confirm: ({ command }) =&gt; `run: ${command}`,
+  }),
+]</code></pre>
+      </details>
+      <details class="reveal">
+        <summary>src/protocols.ts</summary>
+<pre><code>import { isToolCall, textOf, type Message, type Part } from "./messages"
+import type { Tool } from "./tool"
+
+export type Reply = { message: Message; finish: "tool-calls" | "stop" | "refusal" }
+
+// A protocol turns the agent's types into one wire format and back.
+export type Protocol = {
+  path: string
+  body: (model: string, history: Message[], tools: Tool[]) =&gt; unknown
+  decode: (json: unknown) =&gt; Reply
+}
+
+// OpenAI Chat Completions: what Ollama and llama.cpp speak. Only this section knows its wire format.
+type OpenAIResponse = {
+  choices: { message: { content: string | null; tool_calls?: { id: string; function: { name: string; arguments: string } }[] } }[]
+}
+
+const toOpenAITool = (tool: Tool) =&gt; ({
+  type: "function",
+  function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+})
+
+const toOpenAIMessages = (message: Message): unknown[] =&gt; {
+  if (message.role === "tool") {
+    // One role: "tool" message per result. There is no error flag, so the text carries the failure.
+    return message.content.flatMap((part) =&gt;
+      part.type === "tool-result"
+        ? [{ role: "tool", tool_call_id: part.id, content: part.result.type === "error" ? `Error: ${part.result.value}` : part.result.value }]
+        : [],
+    )
+  }
+  if (message.role === "assistant") {
+    const calls = message.content.filter(isToolCall).map((call) =&gt; ({
+      id: call.id,
+      type: "function",
+      // A string input is raw text that did not parse; send it back as it came.
+      function: { name: call.name, arguments: typeof call.input === "string" ? call.input : JSON.stringify(call.input) },
+    }))
+    return [{ role: "assistant", content: textOf(message) || null, ...(calls.length ? { tool_calls: calls } : {}) }]
+  }
+  return [{ role: "user", content: textOf(message) }]
+}
+
+// Arguments arrive as a JSON string. If it does not parse, keep the raw text as the input.
+const parseArguments = (raw: string): unknown =&gt; {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return raw
+  }
+}
+
+export const openaiChat: Protocol = {
+  path: "/chat/completions",
+  body: (model, history, tools) =&gt; ({
+    model,
+    messages: history.flatMap(toOpenAIMessages),
+    reasoning_effort: "none",
+    tools: tools.map(toOpenAITool),
+  }),
+  decode: (json) =&gt; {
+    const message = (json as OpenAIResponse).choices[0]?.message
+    if (!message) throw new Error("No choices returned from model")
+    const content: Part[] = []
+    if (message.content) content.push({ type: "text", text: message.content })
+    for (const call of message.tool_calls ?? []) {
+      content.push({ type: "tool-call", id: call.id, name: call.function.name, input: parseArguments(call.function.arguments) })
+    }
+    return { message: { role: "assistant", content }, finish: content.some(isToolCall) ? "tool-calls" : "stop" }
+  },
+}
+
+// Anthropic Messages: what Claude speaks.
+type AnthropicText = { type: "text"; text: string }
+type AnthropicToolUse = { type: "tool_use"; id: string; name: string; input: unknown }
+type AnthropicBlock = AnthropicText | AnthropicToolUse | { type: string } // e.g. thinking blocks
+type AnthropicResponse = { content: AnthropicBlock[]; stop_reason: string }
+
+const isText = (block: AnthropicBlock): block is AnthropicText =&gt; block.type === "text"
+const isToolUse = (block: AnthropicBlock): block is AnthropicToolUse =&gt; block.type === "tool_use"
+
+// Same name and description as every other tool, but the schema is called input_schema.
+const toAnthropicTool = (tool: Tool) =&gt; ({ name: tool.name, description: tool.description, input_schema: tool.parameters })
+
+const toAnthropicMessage = (message: Message): unknown =&gt; {
+  if (message.role === "tool") {
+    // All the results of a step go back in one user message, and failures carry is_error.
+    return {
+      role: "user",
+      content: message.content.flatMap((part) =&gt;
+        part.type === "tool-result"
+          ? [{ type: "tool_result", tool_use_id: part.id, content: part.result.value, is_error: part.result.type === "error" }]
+          : [],
+      ),
+    }
+  }
+  if (message.role === "assistant") {
+    // Send back exactly what the model produced, thinking blocks included, when we kept it.
+    if (message.native) return { role: "assistant", content: message.native }
+    return {
+      role: "assistant",
+      content: message.content.flatMap((part): unknown[] =&gt;
+        part.type === "text"
+          ? [{ type: "text", text: part.text }]
+          : part.type === "tool-call"
+            ? [{ type: "tool_use", id: part.id, name: part.name, input: part.input }]
+            : [],
+      ),
+    }
+  }
+  return { role: "user", content: textOf(message) }
+}
+
+export const anthropicMessages: Protocol = {
+  path: "/v1/messages",
+  body: (model, history, tools) =&gt; ({
+    model,
+    max_tokens: 16000,
+    messages: history.map(toAnthropicMessage),
+    tools: tools.map(toAnthropicTool),
+  }),
+  decode: (json) =&gt; {
+    const data = json as AnthropicResponse
+    const content: Part[] = []
+    for (const block of data.content) {
+      if (isText(block)) content.push({ type: "text", text: block.text })
+      else if (isToolUse(block)) content.push({ type: "tool-call", id: block.id, name: block.name, input: block.input })
+    }
+    const finish = data.stop_reason === "refusal" ? "refusal" : content.some(isToolCall) ? "tool-calls" : "stop"
+    return { message: { role: "assistant", content, native: data.content }, finish }
+  },
+}</code></pre>
+      </details>
+      <details class="reveal">
+        <summary>src/provider.ts</summary>
+<pre><code>import { Effect } from "effect"
+import { messageOf, ProviderError } from "./errors"
+import type { Message } from "./messages"
+import { anthropicMessages, openaiChat, type Protocol, type Reply } from "./protocols"
+import type { Tool } from "./tool"
+
+// A route binds a protocol to one provider's endpoint and authentication.
+export type Route = { protocol: Protocol; baseUrl: string; headers: Record&lt;string, string&gt;; model: string }
+
+const routes: Record&lt;string, Route&gt; = {
+  ollama: { protocol: openaiChat, baseUrl: "http://127.0.0.1:11434/v1", headers: {}, model: "qwen3.5:9b" },
+  llamacpp: { protocol: openaiChat, baseUrl: "http://127.0.0.1:9931/v1", headers: {}, model: "qwen3.5:9b" },
+  claude: {
+    protocol: anthropicMessages,
+    baseUrl: "https://api.anthropic.com",
+    headers: { "x-api-key": process.env.ANTHROPIC_API_KEY ?? "", "anthropic-version": "2026-10-21" },
+    model: "claude-sonnet-5-5",
+  },
+}
+
+const providerName = process.env.PROVIDER ?? "ollama"
+const selected = routes[providerName]
+if (!selected) throw new Error(`Unknown PROVIDER "${providerName}". Choose one of: ${Object.keys(routes).join(", ")}`)
+if (providerName === "claude" &amp;&amp; !process.env.ANTHROPIC_API_KEY) throw new Error("Set ANTHROPIC_API_KEY first")
+
+// BASE_URL and MODEL still override the route's defaults.
+const route: Route = {
+  ...selected,
+  baseUrl: process.env.BASE_URL ?? selected.baseUrl,
+  model: process.env.MODEL ?? selected.model,
+}
+
+// One step: one model call. It fails with a ProviderError that the user reads; the model never sees it.
+export const chat = (history: Message[], tools: Tool[]) =&gt;
+  Effect.gen(function* () {
+    const unreachable = (error: unknown) =&gt; new ProviderError({ reason: `Could not reach ${route.baseUrl}: ${messageOf(error)}` })
+
+    const response = yield* Effect.tryPromise({
+      try: () =&gt;
+        fetch(`${route.baseUrl}${route.protocol.path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...route.headers },
+          body: JSON.stringify(route.protocol.body(route.model, history, tools)),
+        }),
+      catch: unreachable,
+    })
+    const text = yield* Effect.tryPromise({ try: () =&gt; response.text(), catch: unreachable })
+    if (!response.ok) return yield* new ProviderError({ reason: `${route.baseUrl} answered ${response.status}: ${text}` })
+
+    return yield* Effect.try({
+      try: (): Reply =&gt; route.protocol.decode(JSON.parse(text)),
+      catch: (error) =&gt; new ProviderError({ reason: `Could not read the reply from ${route.baseUrl}: ${messageOf(error)}` }),
+    })
+  })</code></pre>
+      </details>
+      <details class="reveal">
+        <summary>src/index.ts</summary>
+<pre><code>import { Effect } from "effect"
+import { messageOf } from "./errors"
+import { isToolCall, type Message, type ToolResultPart } from "./messages"
+import { chat } from "./provider"
+import { ask } from "./terminal"
+import { runTool } from "./tool"
+import { tools } from "./tools"
+
+const history: Message[] = []
+
+// One prompt: call the model until it stops asking for tools.
+const turn = (input: string) =&gt;
+  Effect.gen(function* () {
+    history.push({ role: "user", content: [{ type: "text", text: input }] })
+
+    while (true) {
+      const { message, finish } = yield* chat(history, tools)
+      history.push(message)
+      for (const part of message.content) {
+        if (part.type === "text" &amp;&amp; part.text) console.log(`Agent: ${part.text}`)
+      }
+      if (finish !== "tool-calls") return
+
+      const results: ToolResultPart[] = []
+      for (const call of message.content.filter(isToolCall)) {
+        console.log(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
+        const result = yield* runTool(tools, call)
+        if (result.result.type === "error") console.log(`[error] ${result.result.value}`)
+        results.push(result)
+      }
+      history.push({ role: "tool", content: results })
+    }
+  })
+
+const program = Effect.gen(function* () {
+  while (true) {
+    const input = yield* ask("You: ")
+
+    // A turn that fails is dropped from the history, so the next prompt starts from a consistent conversation.
+    const before = history.length
+    const drop = (label: string, reason: string) =&gt;
+      Effect.sync(() =&gt; {
+        history.length = before
+        console.log(`[${label}] ${reason}`)
+      })
+
+    yield* turn(input).pipe(
+      Effect.catchTag("ProviderError", (error) =&gt; drop("provider error", error.message)),
+      Effect.catchDefect((defect) =&gt; drop("bug", messageOf(defect))),
+    )
+  }
+}).pipe(Effect.catchTag("InputClosed", () =&gt; Effect.void))
+
+await Effect.runPromise(program)</code></pre>
+      </details>
+    </section>
+
+    <section>
+      <h2>Primary source for this post</h2>
+      <p>
+        OpenCode's <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/ai/src/tool.ts" target="_blank" rel="noopener">ai/src/tool.ts</a> and the <code>ToolFailure</code> comment in
+        <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/ai/src/schema/errors.ts" target="_blank" rel="noopener">schema/errors.ts</a>.
+        Find where its tool decodes the model's input and where it builds the JSON Schema, then list what OpenCode has that the agent does not
+        (an output Schema, <code>toModelOutput</code>, an execution context, a raw JSON Schema as input) and what each one is for. Part 6 takes the next step on that list: the model client and the tools become services that the loop asks for.
+      </p>
+    </section>
+
+    <ul class="sources">
+      <li>Source: <a href="https://effect.website/docs/getting-started/why-effect/" target="_blank" rel="noopener">Effect docs: Why Effect?</a> (the v3 documentation)</li>
+      <li>Source: <a href="https://github.com/Effect-TS/effect/blob/main/MIGRATION.md" target="_blank" rel="noopener">Effect v3 to v4 migration guide</a></li>
+      <li>Source: OpenCode's <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/ai/src/tool.ts" target="_blank" rel="noopener">ai/src/tool.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/ai/src/schema/errors.ts" target="_blank" rel="noopener">schema/errors.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/schema/src/tool.ts" target="_blank" rel="noopener">schema/src/tool.ts</a> and <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/tool/AGENTS.md" target="_blank" rel="noopener">core/src/tool/AGENTS.md</a></li>
+      <li>Measured: the steps above were run on 5 November 2026 in the Part 1 test environment with Effect 4.1.0. The files were type-checked on Effect 4.1.0 and 4.1.2, and the direct calls to <code>runTool</code> gave the same messages on both. The Ollama and llama.cpp transcripts used piped input with pauses between prompts, and llama.cpp ran on a second port with <code>--reasoning off</code> selected with <code>BASE_URL</code>. The failure runs used a port with no server, an unknown model name and the stand-in server above. Claude was not run against the live API.</li>
+    </ul>
+  </main>
+  <script src="../assets/quiz.js"></script>
+</body>
+</html>

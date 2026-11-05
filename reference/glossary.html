@@ -42,6 +42,9 @@
     <h3>Tool result</h3>
     <p>What your code sends back for one tool call: its output as text, or an error.</p>
     <p class="where">Avoid: Tool output, response</p>
+    <h3>Tool failure</h3>
+    <p>A typed error raised while running a tool call. The agent turns it into a tool result of type error, so the model can read it and correct itself.</p>
+    <p class="where">Avoid: Tool error, exception</p>
     <h2>Messages</h2>
     <h3>Message</h3>
     <p>One entry in the conversation history: a role and its content parts.</p>
