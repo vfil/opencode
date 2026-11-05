@@ -38,6 +38,10 @@ _Avoid_: Function call, tool use
 What your code sends back for one tool call: its output as text, or an error.
 _Avoid_: Tool output, response
 
+**Tool failure**:
+A typed error raised while running a tool call. The agent turns it into a tool result of type error, so the model can read it and correct itself.
+_Avoid_: Tool error, exception
+
 ## Messages
 
 **Message**:
