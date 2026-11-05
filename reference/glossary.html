@@ -40,8 +40,15 @@
     <p>The model's structured request to run one tool with given arguments.</p>
     <p class="where">Avoid: Function call, tool use</p>
     <h3>Tool result</h3>
-    <p>What your code sends back for one tool call, including a failure written out as text.</p>
+    <p>What your code sends back for one tool call: its output as text, or an error.</p>
     <p class="where">Avoid: Tool output, response</p>
+    <h2>Messages</h2>
+    <h3>Message</h3>
+    <p>One entry in the conversation history: a role and its content parts.</p>
+    <p class="where">Avoid: Chat message, turn</p>
+    <h3>Content part</h3>
+    <p>One item inside a message: text, a tool call, or a tool result.</p>
+    <p class="where">Avoid: Block, chunk, item</p>
     <h2>The loop</h2>
     <h3>Step</h3>
     <p>Exactly one model call, from request to response.</p>
