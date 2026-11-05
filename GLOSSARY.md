@@ -35,8 +35,18 @@ The model's structured request to run one tool with given arguments.
 _Avoid_: Function call, tool use
 
 **Tool result**:
-What your code sends back for one tool call, including a failure written out as text.
+What your code sends back for one tool call: its output as text, or an error.
 _Avoid_: Tool output, response
+
+## Messages
+
+**Message**:
+One entry in the conversation history: a role and its content parts.
+_Avoid_: Chat message, turn
+
+**Content part**:
+One item inside a message: text, a tool call, or a tool result.
+_Avoid_: Block, chunk, item
 
 ## The loop
 
