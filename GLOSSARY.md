@@ -61,3 +61,17 @@ _Avoid_: Turn, iteration, provider turn
 **Turn**:
 All the steps from a user prompt until the agent goes idle.
 _Avoid_: Step, round
+
+## Wiring
+
+**Service**:
+A capability the agent asks for by name instead of importing it, such as the model client, the terminal or the tools. Its type shows up in the `R` of every Effect that uses it.
+_Avoid_: Dependency, singleton, provider
+
+**Layer**:
+The recipe that builds a service, possibly opening and closing resources. The live layer talks to the real world; a test layer replaces it with a scripted fake.
+_Avoid_: Module, factory, container
+
+**Model client**:
+The service that makes one step: it takes the history and the tools and returns the model's next message.
+_Avoid_: Provider, LLM, chat function

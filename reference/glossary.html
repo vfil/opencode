@@ -59,6 +59,16 @@
     <h3>Turn</h3>
     <p>All the steps from a user prompt until the agent goes idle.</p>
     <p class="where">Avoid: Step, round</p>
+    <h2>Wiring</h2>
+    <h3>Service</h3>
+    <p>A capability the agent asks for by name instead of importing it, such as the model client, the terminal or the tools. Its type shows up in the <code>R</code> of every Effect that uses it.</p>
+    <p class="where">Avoid: Dependency, singleton, provider</p>
+    <h3>Layer</h3>
+    <p>The recipe that builds a service, possibly opening and closing resources. The live layer talks to the real world; a test layer replaces it with a scripted fake.</p>
+    <p class="where">Avoid: Module, factory, container</p>
+    <h3>Model client</h3>
+    <p>The service that makes one step: it takes the history and the tools and returns the model's next message.</p>
+    <p class="where">Avoid: Provider, LLM, chat function</p>
   </main>
 </body>
 </html>
