@@ -73,5 +73,9 @@ The recipe that builds a service, possibly opening and closing resources. The li
 _Avoid_: Module, factory, container
 
 **Model client**:
-The service that makes one step: it takes the history and the tools and returns the model's next message.
+The service that makes one step: it takes the history and the tools and returns the model's next message as a stream of model events.
 _Avoid_: Provider, LLM, chat function
+
+**Model event**:
+One item in the stream a step produces: a piece of text, a complete tool call, or the end of the step with its reason. The agent builds the step's message from these events.
+_Avoid_: Chunk, token, delta (a text piece is one kind of model event)
