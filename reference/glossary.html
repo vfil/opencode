@@ -72,6 +72,19 @@
     <h3>Model event</h3>
     <p>One item in the stream a step produces: a piece of text, a complete tool call, or the end of the step with its reason. The agent builds the step's message from these events.</p>
     <p class="where">Avoid: Chunk, token, delta (a text piece is one kind of model event)</p>
+    <h2>The session</h2>
+    <h3>Session</h3>
+    <p>The durable record of one conversation, kept outside the process so that it survives a restart.</p>
+    <p class="where">Avoid: Chat, thread, conversation</p>
+    <h3>Session event</h3>
+    <p>One fact appended to the session: a prompt, a finished step, a tool result, or a failed turn. Model events are a different thing and are never stored.</p>
+    <p class="where">Avoid: Event (bare), record, entry</p>
+    <h3>Event log</h3>
+    <p>The ordered session events of one session. It only grows; nothing in it is edited or deleted.</p>
+    <p class="where">Avoid: Journal, transcript, message table</p>
+    <h3>History</h3>
+    <p>The messages the next step sends to the model, rebuilt from the event log before every step. It is derived and never stored on its own.</p>
+    <p class="where">Avoid: Context, conversation, projection</p>
   </main>
 </body>
 </html>

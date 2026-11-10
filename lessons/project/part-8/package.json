@@ -1,0 +1,27 @@
+{
+  "name": "my-agent",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "cd playground && bun ../src/index.ts",
+    "start:llamacpp": "cd playground && PROVIDER=llamacpp bun ../src/index.ts",
+    "start:claude": "cd playground && PROVIDER=claude bun ../src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "reset": "sh reset-playground.sh",
+    "db:generate": "drizzle-kit generate",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "drizzle-kit": "1.0.0-rc.5"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@effect/sql-sqlite-bun": "4.1.0",
+    "drizzle-orm": "1.0.0-rc.5",
+    "effect": "4.1.0"
+  }
+}

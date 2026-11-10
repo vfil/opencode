@@ -79,3 +79,21 @@ _Avoid_: Provider, LLM, chat function
 **Model event**:
 One item in the stream a step produces: a piece of text, a complete tool call, or the end of the step with its reason. The agent builds the step's message from these events.
 _Avoid_: Chunk, token, delta (a text piece is one kind of model event)
+
+## The session
+
+**Session**:
+The durable record of one conversation, kept outside the process so that it survives a restart.
+_Avoid_: Chat, thread, conversation
+
+**Session event**:
+One fact appended to the session: a prompt, a finished step, a tool result, or a failed turn. Model events are a different thing and are never stored.
+_Avoid_: Event (bare), record, entry
+
+**Event log**:
+The ordered session events of one session. It only grows; nothing in it is edited or deleted.
+_Avoid_: Journal, transcript, message table
+
+**History**:
+The messages the next step sends to the model, rebuilt from the event log before every step. It is derived and never stored on its own.
+_Avoid_: Context, conversation, projection
