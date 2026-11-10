@@ -1,0 +1,2958 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Part 8: The Session as an Event Log</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <main class="lesson">
+    <nav class="nav-links">
+      <a href="0007-streaming.html">← Part 7: Streaming</a>
+      <a href="../reference/agent-architecture.html">Reference: Agent architecture</a>
+      <a href="../reference/tool-design.html">Reference: Tool design</a>
+      <a href="../reference/glossary.html">Glossary</a>
+    </nav>
+
+    <header>
+      <p class="lesson-kicker">Coding an AI Agent · Part 8 · Stage B · Session</p>
+      <h1>The Session as an Event Log</h1>
+      <p class="subtitle">Append every prompt, step and tool result to a SQLite file, and rebuild the history from that file before every step. Kill the agent in the middle of a tool call, start it again, and it picks the turn up where it stopped.</p>
+    </header>
+
+    <section>
+      <h2>Start from what the process forgets</h2>
+      <p>
+        The agent from Part 7 keeps the conversation in an array. <code>index.ts</code> passes <code>repl</code> an empty one, <code>turn</code> pushes every message onto it, and when the process ends the array goes with it. Close the terminal after twenty minutes of work and the next run starts with no memory of the files it read, the commands it ran or what the user asked.
+      </p>
+      <p>
+        The end of <a href="0002-the-roadmap.html">Part 2</a> asked what is lost when Ctrl-C stops an agent halfway through a task, and what the smallest thing is that must be on disk to get it back. The first half has a precise answer. Everything the process knew is lost: the messages, and also which tool calls had finished. The second half is what this post builds. The smallest record is one entry per fact, written when the fact happens: the prompt, each finished step, each tool result. Nothing else needs saving, because the rest, such as the order of the messages or which calls still wait for a result, can be worked out from those entries.
+      </p>
+      <p>
+        What a restart finds depends on where the process died. Each row of this table is one place it can die, with what the file holds and what the next run has to do:
+      </p>
+      <table>
+        <tr><th>The process dies...</th><th>The file ends with</th><th>The next run has to</th></tr>
+        <tr><td>before the model has answered the prompt</td><td>the prompt</td><td>call the model</td></tr>
+        <tr><td>while a reply is streaming</td><td>the prompt, or the last tool result</td><td>call the model again; the half reply was never stored</td></tr>
+        <tr><td>after a step asked for tools, before any ran</td><td>the step, with its tool calls</td><td>give each call a result that says it was interrupted, then call the model</td></tr>
+        <tr><td>while a tool runs, or between two tools</td><td>the step, and the results so far</td><td>the same, for the calls that have no result</td></tr>
+        <tr><td>after the last tool result</td><td>that result</td><td>call the model</td></tr>
+        <tr><td>after the final answer</td><td>the step with no tool calls</td><td>nothing</td></tr>
+      </table>
+      <p>
+        The agent changes in three places. Each fact is appended to a SQLite table as it happens. The history for a step is rebuilt from that table instead of read from an array. And at startup, the agent looks at where the last turn ended and finishes it.
+      </p>
+    </section>
+
+    <section>
+      <h2>The log</h2>
+
+      <h3>A short introduction to Drizzle</h3>
+      <p>
+        The table is declared and queried with <a href="https://orm.drizzle.team/" target="_blank" rel="noopener">Drizzle</a>, a TypeScript ORM. An ORM (object-relational mapper) is a library that maps database tables to typed code: the table is declared once as a TypeScript value, and the queries built from it are checked by the compiler. Drizzle also comes with a command-line tool, Drizzle Kit, that compares the declared tables with the previous version and writes the difference as a <em>migration</em>, a SQL file that takes a database from one version of its schema to the next. The program applies the migrations when it starts, so a database file is created, or brought up to date, by the same code that uses it.
+      </p>
+      <p>
+        Drizzle's own <a href="https://orm.drizzle.team/docs/get-started/bun-sqlite-new" target="_blank" rel="noopener">getting started guide for Bun and SQLite</a> covers the plain version of what follows: install, declare a table, connect, run queries. Two things differ here. This post uses the Effect driver, <code>drizzle-orm/effect-sqlite-bun</code>, in which every query is an Effect that is run with <code>yield*</code> and fails with a typed error, like everything else in the agent. It runs on <code>@effect/sql-sqlite-bun</code>, Effect's own SQLite client for Bun. And the driver is part of Drizzle's 1.0 release candidate, which is the line OpenCode builds on (<a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/database/database.ts#L14" target="_blank" rel="noopener">core/src/database/database.ts</a>, which also applies its migrations at startup, on <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/database/database.ts#L51" target="_blank" rel="noopener">line 51</a>). The code below pins exact versions, because a release candidate can still change.
+      </p>
+
+      <h3>Four words</h3>
+      <p>
+        The <a href="../reference/glossary.html">glossary</a> has four new terms for this part. A <em>session</em> is the durable record of one conversation. A <em>session event</em> is one fact appended to it. The <em>event log</em> is the ordered events of one session, and the <em>history</em> is the list of messages the next step sends to the model, rebuilt from the log. A session event is a different thing from a model event: model events are what a step's stream carries while the model answers, and they are never stored.
+      </p>
+
+      <h3>Six decisions in the design</h3>
+
+      <h3>1. Four events, and each one a fact that cannot be worked out from the others</h3>
+      <p>
+        OpenCode's AGENTS.md says to record only the irreducible: "Keep durable events minimal: record irreducible new facts and do not repeat state derivable by folding the ordered aggregate history". Applied to this agent, that leaves four events:
+      </p>
+      <table>
+        <tr><th>Event</th><th>The fact</th><th>When it is appended</th></tr>
+        <tr><td><code>prompt</code></td><td>The user said this</td><td>When the user's line is read</td></tr>
+        <tr><td><code>step-finished</code></td><td>The model answered with this message, and the step ended for this reason</td><td>When the stream of a step has ended</td></tr>
+        <tr><td><code>tool-result</code></td><td>This tool call produced this result</td><td>As soon as each tool finishes, one event per call</td></tr>
+        <tr><td><code>turn-failed</code></td><td>The turn ended in an error</td><td>When a provider error or a bug ends a turn (step 4)</td></tr>
+      </table>
+      <p>
+        Text pieces are not events. The finished message already holds the whole text, and nothing needs the pieces after the screen showed them. There is no <code>step-started</code> or <code>tool-called</code> either, because the call is inside the <code>step-finished</code> that asked for it. A tool result is one event per call and not one per step. A step that asks for three tools and dies after the first has one result worth keeping.
+      </p>
+
+      <h3>2. The history is a fold of the events</h3>
+      <p>
+        The history is not stored anywhere. A function, <code>toHistory</code>, reads the events in order and builds the messages: a <code>prompt</code> becomes a user message, a <code>step-finished</code> becomes its assistant message, and the <code>tool-result</code> events that follow one another become one <code>tool</code> message, which is the shape Part 4 chose. (A <em>fold</em> is a loop that walks a list and builds one value from it, the way <code>reduce</code> does.) Because the function only reads, it can be tested without a database, and the same events always give the same history.
+      </p>
+
+      <h3>3. The history is rebuilt before every step</h3>
+      <p>
+        OpenCode's AGENTS.md has a rule that Part 2 quoted: "Each step is one explicit <code>llm.stream</code> call that continues from reloaded history. Do not add an in-memory tool loop." The loop in <code>agent.ts</code> now follows it. Before each step it asks the session for the history, and it keeps no messages of its own between steps. So no moment in the loop is special for recovery. The state at any point is the file, and a restart reads the same file the next step would have read.
+      </p>
+      <p>
+        The price is a read of the whole log before every step. Part 2 asked what OpenCode gets in exchange for it; step 7 measures the price. OpenCode itself does not fold events on each read. It projects them into message tables as they are appended and loads the history from those tables (<a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/session/sql.ts#L86-L102" target="_blank" rel="noopener">core/src/session/sql.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/session/history.ts#L277-L283" target="_blank" rel="noopener">core/src/session/history.ts</a>), so that a read does not replay the events. The agent here has one table and rebuilds the history on each read.
+      </p>
+
+      <h3>4. A failed turn is an event</h3>
+      <p>
+        Part 5 dropped a failed turn by cutting the history array back to its length before the prompt. A log only grows, so the agent appends a <code>turn-failed</code> event, and <code>toHistory</code> leaves out every event from that turn's prompt through the failure. The file keeps the whole story, including the half-finished steps, and the model never sees a conversation that ends with a prompt nobody answered.
+      </p>
+      <p>
+        A crash is different from a failure. A provider error is caught, so the agent has time to append <code>turn-failed</code>. A killed process appends nothing. That absence is what the next run recognises as an unfinished turn.
+      </p>
+
+      <h3>5. A restart answers unfinished tool calls with an error, and never runs them again</h3>
+      <p>
+        A <code>step-finished</code> event without a matching <code>tool-result</code> means one of three things: the tool never started, it was running when the process died, or it finished and the process died before the result was appended. The log cannot tell them apart. Running the call again would be wrong in the second and third case, because a <code>bash</code> command or a <code>write_file</code> that already ran would run twice, and the user's earlier <code>y</code> does not cover a second run.
+      </p>
+      <p>
+        So the restart appends a <code>tool-result</code> of type error for each unanswered call: "The agent stopped before this tool finished, so it may or may not have run. Check the current state before repeating it." The model reads it as any other tool failure from Part 5 and decides what to do, usually by looking at the files. OpenCode has the same problem and handles it in its own terms. Its step runner fails a tool that never settled with the error <code>Tool execution interrupted</code> (<a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/session/runner/step.ts#L60-L62" target="_blank" rel="noopener">core/src/session/runner/step.ts</a>). Its restart sweep resumes an interrupted turn with the prompt "Continue from where you left off without repeating completed work", and a comment on the sweep states the guarantee: recovery is at-least-once, and it prevents concurrent drains but not repeated external side effects after a crash (<a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/session/execution/restart.ts#L16-L17" target="_blank" rel="noopener">core/src/session/execution/restart.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/session/execution/restart.ts#L53-L54" target="_blank" rel="noopener">comment</a>). The rule here, never run a call that has no result, is a simpler policy.
+      </p>
+
+      <h3>6. Rows are checked when they are read</h3>
+      <p>
+        The database file is input from outside the program, like the arguments a model sends to a tool in Part 5. It can be edited by hand, or written by an older version of the agent. Each row is decoded with an Effect Schema when it is read, and a row that no longer matches fails with a <code>SessionCorrupt</code> error that names the event's number. The program prints it and exits; it does not guess what the row meant. To make this possible without a second set of definitions, <code>messages.ts</code> now declares the message and part types as Schemas, and the TypeScript types come from them.
+      </p>
+
+      <h3>What this leaves for later</h3>
+      <p>
+        A prompt is still written and run in the same act: if the process dies after the user pressed Enter and before the <code>prompt</code> event was appended, the prompt is lost. Part 9 separates saving a prompt from running it. Only one process may write to a session: the event numbers are counted by the process that writes them, and a second writer on the same session fails with <code>UNIQUE constraint failed: event.session_id, event.seq</code> because the pair is the table's primary key. And a session never shrinks, so a long task will eventually outgrow the model's context window, which is Part 10.
+      </p>
+    </section>
+
+    <section>
+      <h2>Check yourself</h2>
+      <div class="quiz">
+        <p class="quiz-question">The process is killed while a <code>bash</code> command runs. The step that asked for it was already appended. What is the last event in the log?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">A <code>tool-result</code> with an error</button>
+          <button class="quiz-option" data-correct="true">The <code>step-finished</code> that contains the call</button>
+          <button class="quiz-option" data-correct="false">A <code>turn-failed</code></button>
+          <button class="quiz-option" data-correct="false">Nothing: the step is only saved when the tools are done</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. The result is appended after the tool returns, so a killed process leaves the call without one. That is how the next run recognises the unfinished turn." data-wrong-text="A killed process runs no code, so nothing marks the turn as failed. The step was appended before the tools started, and the result would have been appended after the command returned." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">A step asked for two tool calls. The first has a <code>tool-result</code>, the process died during the second. What does the next run do with the second call?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">Runs it again, because it has no result</button>
+          <button class="quiz-option" data-correct="false">Asks the user whether to run it again</button>
+          <button class="quiz-option" data-correct="true">Appends an error result that says it was interrupted, and calls the model</button>
+          <button class="quiz-option" data-correct="false">Deletes the step and starts the turn over</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. The command may have run to the end before the process died, and running it twice can do harm. The model gets the error and checks the state." data-wrong-text="Nothing in the log says whether the command ran. The restart never runs it again and never deletes events; it appends an error result and lets the model decide." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">Why is a failed turn recorded with a <code>turn-failed</code> event instead of deleting its events?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">Deleting rows is slower in SQLite</button>
+          <button class="quiz-option" data-correct="true">The log only grows, and the history can leave out what the model should not see</button>
+          <button class="quiz-option" data-correct="false">The model needs to read the error message</button>
+          <button class="quiz-option" data-correct="false">Drizzle has no delete query</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. The file keeps what happened, including the steps of the failed turn, and toHistory decides what the next step sees. The model never reads the reason; the user does." data-wrong-text="Deleting is possible and fast. The reason is the design: the log is a record of facts, and what the model sees is a separate decision made when the history is rebuilt." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">A step asks for three tools, and the process dies after the second finishes. Why does it matter that each result is its own event?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">SQLite cannot store an array in one row</button>
+          <button class="quiz-option" data-correct="true">The first two results are already in the file and are not lost</button>
+          <button class="quiz-option" data-correct="false">The model would otherwise see the results in the wrong order</button>
+          <button class="quiz-option" data-correct="false">The results could not be checked against a Schema</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. With one event per step, the results of the finished tools would die with the process, and the restart would have to treat all three calls as interrupted." data-wrong-text="A row can hold any JSON, and order is kept either way. The difference is what survives a crash between two tools." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">What does rebuilding the history before every step give the loop, apart from the ability to resume?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">Faster steps, because the file is cached</button>
+          <button class="quiz-option" data-correct="true">No state of its own to keep in sync with the file: the next step reads what the file says</button>
+          <button class="quiz-option" data-correct="false">A smaller context window</button>
+          <button class="quiz-option" data-correct="false">Protection against two writers</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. A loop that keeps its own array has two copies of the conversation that can disagree after a crash. A loop that reads the file has one. Resuming is then the same code as continuing." data-wrong-text="Reloading is slower, not faster, and it does not shrink the context or arbitrate between writers. What it removes is a second copy of the conversation." hidden></p>
+      </div>
+
+      <div class="quiz">
+        <p class="quiz-question">A row in the <code>event</code> table holds <code>{"type":"prompt"}</code>, without the text. What happens when the agent starts?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-correct="false">The prompt is replayed with an empty text</button>
+          <button class="quiz-option" data-correct="false">The row is skipped</button>
+          <button class="quiz-option" data-correct="true">Reading the log fails with a <code>SessionCorrupt</code> that names the event's number, and the agent exits</button>
+          <button class="quiz-option" data-correct="false">The migration repairs the row</button>
+        </div>
+        <p class="quiz-feedback" data-correct-text="Right. A skipped event would change the conversation without anyone knowing, so the read fails and says which row to look at." data-wrong-text="The agent does not repair, skip or guess. A row that does not decode stops the read, and the error carries the session and the event number." hidden></p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Your turn: the session log</h2>
+      <p>
+        Work in the <code>my-agent</code> folder from Part 7. This part adds five files, a generated migration and three test files, and changes seven of the existing files:
+      </p>
+      <table>
+        <tr><th>File</th><th>Change</th></tr>
+        <tr><td><code>package.json</code>, <code>.gitignore</code></td><td>Drizzle and the SQLite client as dependencies, a <code>db:generate</code> script, and the database file ignored</td></tr>
+        <tr><td><code>drizzle.config.ts</code>, <code>drizzle/</code></td><td>New. Drizzle Kit's settings, and the generated migration</td></tr>
+        <tr><td><code>src/session-table.ts</code></td><td>New. The <code>event</code> table</td></tr>
+        <tr><td><code>src/messages.ts</code></td><td>The message types become Schemas</td></tr>
+        <tr><td><code>src/errors.ts</code></td><td>Gains <code>SessionCorrupt</code></td></tr>
+        <tr><td><code>src/session-event.ts</code></td><td>New. The four session events as a Schema</td></tr>
+        <tr><td><code>src/history.ts</code></td><td>New. <code>toHistory</code> and <code>unansweredCalls</code></td></tr>
+        <tr><td><code>src/session.ts</code></td><td>New. The <code>Session</code> service and <code>SessionLive</code></td></tr>
+        <tr><td><code>src/agent.ts</code></td><td><code>step</code> reloads and appends, <code>turn</code> and <code>repl</code> lose their <code>history</code>, and <code>resume</code> is added</td></tr>
+        <tr><td><code>src/index.ts</code></td><td>Adds <code>SessionLive</code> to the layers</td></tr>
+        <tr><td><code>test/agent.test.ts</code></td><td>Runs the loop on a session kept in memory</td></tr>
+        <tr><td><code>test/resume.test.ts</code>, <code>test/history.test.ts</code>, <code>test/session.test.ts</code></td><td>New. The restart, the fold and the file</td></tr>
+      </table>
+      <p>
+        <code>events.ts</code>, <code>sse.ts</code>, <code>terminal.ts</code>, <code>model-client.ts</code>, <code>protocols.ts</code>, <code>provider.ts</code>, <code>tool.ts</code>, <code>tools.ts</code> and the test files for the model, protocols and provider do not change. Each step ends with code that type-checks and runs, so the work can stop after any of them. Step 3 ends with two failing tests on purpose, and step 4 fixes them.
+      </p>
+
+      <h3>Step 1: The log table</h3>
+      <p>
+        Install the two runtime packages and Drizzle Kit, with exact versions, since the Effect driver is part of a release candidate:
+      </p>
+<pre><code>bun add drizzle-orm@1.0.0-rc.5 @effect/sql-sqlite-bun@4.1.0
+bun add -d drizzle-kit@1.0.0-rc.5</code></pre>
+      <p>
+        The table has one row per session event. <code>session_id</code> and <code>seq</code> together identify an event: <code>seq</code> counts from 1 within a session and gives the order. <code>type</code> repeats the event's type so that rows can be filtered by it without opening the JSON, and <code>data</code> holds the event as JSON (Drizzle's <code>mode: "json"</code> converts it on the way in and out). Columns are named in snake_case so the property name is the column name, which is also the convention in OpenCode's AGENTS.md. Create <code>src/session-table.ts</code>:
+      </p>
+<pre><code>import { integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core"
+
+// The event log: one row per session event. `seq` orders the events of a session.
+export const EventTable = sqliteTable(
+  "event",
+  {
+    session_id: text().notNull(),
+    seq: integer().notNull(),
+    type: text().notNull(),
+    data: text({ mode: "json" }).notNull(),
+  },
+  (table) =&gt; [primaryKey({ columns: [table.session_id, table.seq] })],
+)</code></pre>
+      <p>
+        Drizzle Kit reads a small config file that says which SQL dialect to write, where the table declarations are and where to put the migrations. Create <code>drizzle.config.ts</code> in the project folder, next to <code>package.json</code>:
+      </p>
+<pre><code>import { defineConfig } from "drizzle-kit"
+
+export default defineConfig({
+  dialect: "sqlite",
+  schema: "./src/session-table.ts",
+  out: "./drizzle",
+})</code></pre>
+      <p>
+        Add a script to <code>package.json</code> so the command is the same everywhere:
+      </p>
+<pre><code>    "db:generate": "drizzle-kit generate",</code></pre>
+      <p>
+        Run it with <code>bun run db:generate --name event_log</code>; the script is needed because Drizzle Kit is installed in the project, not on the shell's path, so typing <code>drizzle-kit</code> alone fails with <code>command not found</code>. Drizzle Kit compares the declared tables with the snapshot of the previous migration, which does not exist yet, and writes the difference. The folder name starts with the time of the run, so yours will have a different number:
+      </p>
+<pre class="transcript"><code>$ bun run db:generate --name event_log
+$ drizzle-kit generate --name event_log
+No config path provided, using default 'drizzle.config.ts'
+Reading config file '/path/to/my-agent/drizzle.config.ts'
+[✓] Your SQL migration ➜ drizzle/20261109205302_event_log/migration.sql 🚀</code></pre>
+      <p>
+        The folder holds <code>migration.sql</code>, which is the statement that creates the table, and <code>snapshot.json</code>, which is what the next run compares against.
+      </p>
+<pre><code>CREATE TABLE `event` (
+	`session_id` text NOT NULL,
+	`seq` integer NOT NULL,
+	`type` text NOT NULL,
+	`data` text NOT NULL,
+	CONSTRAINT `event_pk` PRIMARY KEY(`session_id`, `seq`)
+);</code></pre>
+      <p>
+        Nothing reads the table yet. Run <code>bun run typecheck</code> and <code>bun run test</code>; the eighteen tests from Part 7 still pass.
+      </p>
+<details class="reveal">
+<summary>Stuck? The finished package.json</summary>
+<p class="where"><code>package.json</code></p>
+<pre><code>{
+  "name": "my-agent",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "cd playground &amp;&amp; bun ../src/index.ts",
+    "start:llamacpp": "cd playground &amp;&amp; PROVIDER=llamacpp bun ../src/index.ts",
+    "start:claude": "cd playground &amp;&amp; PROVIDER=claude bun ../src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "reset": "sh reset-playground.sh",
+    "db:generate": "drizzle-kit generate",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "drizzle-kit": "1.0.0-rc.5"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@effect/sql-sqlite-bun": "4.1.0",
+    "drizzle-orm": "1.0.0-rc.5",
+    "effect": "4.1.0"
+  }
+}</code></pre>
+</details>
+
+      <h3>Step 2: The Session service</h3>
+      <p>
+        This step builds everything that reads and writes the log, and leaves the agent alone. Start with the types. In <code>src/messages.ts</code>, replace the type declarations with Schemas, and derive the types from them. A Schema is one value that describes a shape. Part 5 used one to check a tool's input, and here the same definition checks a message read back from the file. <code>Schema.mutable</code> keeps <code>content</code> an ordinary array, because the loop builds it with <code>push</code>. The two helpers at the end are as they were:
+      </p>
+<pre><code>import { Schema } from "effect"
+
+// The agent's own message types. No protocol appears in them. Each is a Schema, so the same definition
+// that gives the type also checks the messages read back from the session log.
+export const TextPart = Schema.Struct({ type: Schema.Literal("text"), text: Schema.String })
+export const ToolCallPart = Schema.Struct({
+  type: Schema.Literal("tool-call"),
+  id: Schema.String,
+  name: Schema.String,
+  input: Schema.Unknown,
+})
+export const ToolResultValue = Schema.Struct({ type: Schema.Literals(["text", "error"]), value: Schema.String })
+export const ToolResultPart = Schema.Struct({
+  type: Schema.Literal("tool-result"),
+  id: Schema.String,
+  name: Schema.String,
+  result: ToolResultValue,
+})
+export const Part = Schema.Union([TextPart, ToolCallPart, ToolResultPart])
+
+export const Message = Schema.Struct({
+  role: Schema.Literals(["user", "assistant", "tool"]),
+  content: Schema.mutable(Schema.Array(Part)),
+  // The provider's own content for this message, kept so the same protocol can send it back unchanged.
+  native: Schema.optional(Schema.Unknown),
+})
+
+export type TextPart = typeof TextPart.Type
+export type ToolCallPart = typeof ToolCallPart.Type
+export type ToolResultValue = typeof ToolResultValue.Type
+export type ToolResultPart = typeof ToolResultPart.Type
+export type Part = typeof Part.Type
+export type Message = typeof Message.Type
+
+export const isToolCall = (part: Part): part is ToolCallPart =&gt; part.type === "tool-call"
+export const textOf = (message: Message) =&gt; message.content.flatMap((part) =&gt; (part.type === "text" ? [part.text] : [])).join("\n")</code></pre>
+      <p>
+        In <code>src/errors.ts</code>, add the error for a row that does not decode, above <code>InputClosed</code>:
+      </p>
+<pre><code>// A stored session event that no longer matches the schema, such as a file edited by hand or written by an older version.
+export class SessionCorrupt extends Schema.TaggedError&lt;SessionCorrupt&gt;()("SessionCorrupt", {
+  session: Schema.String,
+  seq: Schema.Number,
+  problem: Schema.String,
+}) {
+  override get message() {
+    return `Session ${this.session} cannot be read: event ${this.seq} ${this.problem}`
+  }
+}</code></pre>
+      <p>
+        Create <code>src/session-event.ts</code> with the events from decision 1. Only three exist so far; <code>turn-failed</code> comes in step 4. Their payloads reuse the message Schemas:
+      </p>
+<pre><code>import { Schema } from "effect"
+import { Message, ToolResultPart } from "./messages"
+
+// The facts a session records. Nothing here can be worked out from the other events.
+export const Prompt = Schema.Struct({ type: Schema.Literal("prompt"), text: Schema.String })
+
+// One finished model call: the whole assistant message and why the step ended.
+export const StepFinished = Schema.Struct({
+  type: Schema.Literal("step-finished"),
+  message: Message,
+  finish: Schema.Literals(["tool-calls", "stop", "refusal"]),
+})
+
+// One tool call's result. A step with three calls appends three of these, one as soon as each finishes.
+export const ToolResult = Schema.Struct({ type: Schema.Literal("tool-result"), part: ToolResultPart })
+
+export const SessionEvent = Schema.Union([Prompt, StepFinished, ToolResult])
+export type SessionEvent = typeof SessionEvent.Type</code></pre>
+      <p>
+        Create <code>src/history.ts</code> with the fold from decision 2. It is a plain function from a list of events to a list of messages, with no database and no Effect:
+      </p>
+<pre><code>import type { Message } from "./messages"
+import type { SessionEvent } from "./session-event"
+
+// The messages the next step sends to the model, rebuilt from the session events.
+export const toHistory = (events: ReadonlyArray&lt;SessionEvent&gt;): Message[] =&gt; {
+  const history: Message[] = []
+
+  for (const event of events) {
+    if (event.type === "prompt") {
+      history.push({ role: "user", content: [{ type: "text", text: event.text }] })
+    } else if (event.type === "step-finished") {
+      history.push(event.message)
+    } else {
+      // Results that follow one another belong to one tool message.
+      const last = history.at(-1)
+      if (last?.role === "tool") last.content.push(event.part)
+      else history.push({ role: "tool", content: [event.part] })
+    }
+  }
+  return history
+}</code></pre>
+      <p>
+        Now the service. It is declared like <code>Terminal</code> and <code>ModelClient</code> in Part 6, by what the agent needs from it: an <code>id</code> to show the user, <code>append</code> to record a fact, and two Effects that read the log. <code>events</code> is the raw list and <code>history</code> is that list passed through <code>toHistory</code>. Every run of either reads the table again. Create <code>src/session.ts</code> and start with the imports and the service:
+      </p>
+<pre><code>import { SqliteClient } from "@effect/sql-sqlite-bun"
+import { asc, eq, max } from "drizzle-orm"
+import * as SQLiteBunDrizzle from "drizzle-orm/effect-sqlite-bun"
+import { migrate } from "drizzle-orm/effect-sqlite-bun/migrator"
+import { Context, Effect, Layer, Schema } from "effect"
+import { SessionCorrupt } from "./errors"
+import { toHistory } from "./history"
+import type { Message } from "./messages"
+import { SessionEvent } from "./session-event"
+import { EventTable } from "./session-table"
+
+// What the agent needs from its session: append a fact, and read the facts back.
+export class Session extends Context.Service&lt;
+  Session,
+  {
+    readonly id: string
+    readonly append: (event: SessionEvent) =&gt; Effect.Effect&lt;void&gt;
+    // Every call reads the log again.
+    readonly events: Effect.Effect&lt;SessionEvent[], SessionCorrupt&gt;
+    readonly history: Effect.Effect&lt;Message[], SessionCorrupt&gt;
+  }
+&gt;()("@agent/Session") {}</code></pre>
+      <p>
+        The live layer is the rest of the file. It is shown whole, and the list after it goes through it in order:
+      </p>
+<pre><code>const migrationsFolder = new URL("../drizzle", import.meta.url).pathname
+const decode = Schema.decodeUnknownEffect(SessionEvent)
+const encode = Schema.encodeSync(SessionEvent)
+
+// The real session: a SQLite file. Building the layer opens the file and applies the migrations;
+// the end of the program closes it. A disk failure is a defect, not something the agent can handle.
+export const SessionLive = (options: { path: string; id: string }) =&gt;
+  Layer.effect(
+    Session,
+    Effect.gen(function* () {
+      const db = yield* SQLiteBunDrizzle.makeWithDefaults()
+      yield* migrate(db, { migrationsFolder })
+
+      const thisSession = eq(EventTable.session_id, options.id)
+
+      // The numbering continues where the log stops. One process writes a session, so it can count for itself.
+      const [last] = yield* db.select({ seq: max(EventTable.seq) }).from(EventTable).where(thisSession)
+      let seq = last?.seq ?? 0
+
+      // A row that no longer matches the schema stops the read and says which event it was.
+      const readEvent = (row: typeof EventTable.$inferSelect) =&gt;
+        decode(row.data).pipe(
+          Effect.mapError((error) =&gt; new SessionCorrupt({ session: options.id, seq: row.seq, problem: error.message })),
+        )
+
+      const events = db.select().from(EventTable).where(thisSession).orderBy(asc(EventTable.seq)).pipe(
+        Effect.flatMap(Effect.forEach(readEvent)),
+        Effect.catchTag("EffectDrizzleQueryError", Effect.die),
+      )
+
+      const append = (event: SessionEvent) =&gt;
+        Effect.suspend(() =&gt;
+          db.insert(EventTable).values({ session_id: options.id, seq: ++seq, type: event.type, data: encode(event) }),
+        ).pipe(Effect.asVoid, Effect.orDie)
+
+      return Session.of({ id: options.id, append, events, history: Effect.map(events, toHistory) })
+    }).pipe(Effect.orDie),
+  ).pipe(Layer.provide(SqliteClient.layer({ filename: options.path }).pipe(Layer.orDie)))</code></pre>
+      <ol>
+        <li><code>migrationsFolder</code> is found relative to this file, because the agent runs from <code>playground/</code> and not from the project folder. <code>decode</code> and <code>encode</code> are the Schema's two directions.</li>
+        <li>Building the layer does the work that used to happen at import time, as in Part 6. <code>makeWithDefaults()</code> creates the Drizzle database on top of the SQLite client, which the layer at the bottom of the file provides, and <code>migrate</code> applies the folder from step 1, creating the table on the first run.</li>
+        <li>A query is built with <code>db.select().from(table).where(...)</code> as in the Drizzle guide, and here it can be passed to <code>yield*</code>. <code>thisSession</code> is the condition shared by the queries, and the first query finds the highest event number in the log so that the numbering continues across restarts.</li>
+        <li>Reading is one query ordered by <code>seq</code>, then a decode of each row. A row that fails the Schema becomes a <code>SessionCorrupt</code> with the row's number. The query's own error, <code>EffectDrizzleQueryError</code>, means the disk or the file failed, which the agent cannot handle, so it becomes a defect (Part 5's word for an error the program does not plan for) and ends up in the same place as other bugs.</li>
+        <li>Appending is one insert. The query builder is created inside <code>Effect.suspend</code>, so the number is taken when the append runs and not when the Effect is built. When the insert finishes, the row is in the file: the process can be killed on the next line and the event stays. (The SQLite client opens the file in WAL mode, write-ahead logging, in which changes are first written to a separate log file next to the database.)</li>
+        <li>The last lines are the layer's wiring. <code>Effect.orDie</code> turns the layer's own failures, such as a migration that cannot run, into defects, and <code>SqliteClient.layer</code> opens the file for the lifetime of the layer and closes it afterwards.</li>
+      </ol>
+      <p>
+        Try the service on its own. This script appends the three events of a one-tool turn to a new file and prints the history built from them:
+      </p>
+<pre><code>bun -e '
+import { Effect } from "effect"
+import { Session, SessionLive } from "./src/session"
+
+const program = Effect.gen(function* () {
+  const session = yield* Session
+  yield* session.append({ type: "prompt", text: "List the files" })
+  yield* session.append({
+    type: "step-finished",
+    finish: "tool-calls",
+    message: { role: "assistant", content: [{ type: "tool-call", id: "call_1", name: "list_files", input: { path: "." } }] },
+  })
+  yield* session.append({
+    type: "tool-result",
+    part: { type: "tool-result", id: "call_1", name: "list_files", result: { type: "text", value: "README.md" } },
+  })
+  return yield* session.history
+})
+
+const history = await Effect.runPromise(program.pipe(Effect.provide(SessionLive({ path: "try.db", id: "demo" }))))
+for (const message of history) console.log(message.role.padEnd(9), JSON.stringify(message.content))
+'</code></pre>
+      <p>
+        The history has the three messages of Part 4's shape, and the file has three rows. The file is plain SQLite, so any SQLite tool can read it:
+      </p>
+<pre class="transcript"><code>user      [{"type":"text","text":"List the files"}]
+assistant [{"type":"tool-call","id":"call_1","name":"list_files","input":{"path":"."}}]
+tool      [{"type":"tool-result","id":"call_1","name":"list_files","result":{"type":"text","value":"README.md"}}]
+
+$ sqlite3 -header -column try.db "select session_id, seq, type, length(data) as bytes from event"
+session_id  seq  type           bytes
+----------  ---  -------------  -----
+demo        1    prompt         41   
+demo        2    step-finished  165  
+demo        3    tool-result    131  </code></pre>
+      <p>
+        Delete <code>try.db</code> and its <code>-wal</code> and <code>-shm</code> files when you are done. <code>bun run typecheck</code> and <code>bun run test</code> still pass.
+      </p>
+<details class="reveal">
+<summary>Stuck? The finished messages.ts, session-event.ts, history.ts and session.ts</summary>
+<p class="where"><code>src/messages.ts</code></p>
+<pre><code>import { Schema } from "effect"
+
+// The agent's own message types. No protocol appears in them. Each is a Schema, so the same definition
+// that gives the type also checks the messages read back from the session log.
+export const TextPart = Schema.Struct({ type: Schema.Literal("text"), text: Schema.String })
+export const ToolCallPart = Schema.Struct({
+  type: Schema.Literal("tool-call"),
+  id: Schema.String,
+  name: Schema.String,
+  input: Schema.Unknown,
+})
+export const ToolResultValue = Schema.Struct({ type: Schema.Literals(["text", "error"]), value: Schema.String })
+export const ToolResultPart = Schema.Struct({
+  type: Schema.Literal("tool-result"),
+  id: Schema.String,
+  name: Schema.String,
+  result: ToolResultValue,
+})
+export const Part = Schema.Union([TextPart, ToolCallPart, ToolResultPart])
+
+export const Message = Schema.Struct({
+  role: Schema.Literals(["user", "assistant", "tool"]),
+  content: Schema.mutable(Schema.Array(Part)),
+  // The provider's own content for this message, kept so the same protocol can send it back unchanged.
+  native: Schema.optional(Schema.Unknown),
+})
+
+export type TextPart = typeof TextPart.Type
+export type ToolCallPart = typeof ToolCallPart.Type
+export type ToolResultValue = typeof ToolResultValue.Type
+export type ToolResultPart = typeof ToolResultPart.Type
+export type Part = typeof Part.Type
+export type Message = typeof Message.Type
+
+export const isToolCall = (part: Part): part is ToolCallPart =&gt; part.type === "tool-call"
+export const textOf = (message: Message) =&gt; message.content.flatMap((part) =&gt; (part.type === "text" ? [part.text] : [])).join("\n")</code></pre>
+<p class="where"><code>src/session-event.ts</code></p>
+<pre><code>import { Schema } from "effect"
+import { Message, ToolResultPart } from "./messages"
+
+// The facts a session records. Nothing here can be worked out from the other events.
+export const Prompt = Schema.Struct({ type: Schema.Literal("prompt"), text: Schema.String })
+
+// One finished model call: the whole assistant message and why the step ended.
+export const StepFinished = Schema.Struct({
+  type: Schema.Literal("step-finished"),
+  message: Message,
+  finish: Schema.Literals(["tool-calls", "stop", "refusal"]),
+})
+
+// One tool call's result. A step with three calls appends three of these, one as soon as each finishes.
+export const ToolResult = Schema.Struct({ type: Schema.Literal("tool-result"), part: ToolResultPart })
+
+export const SessionEvent = Schema.Union([Prompt, StepFinished, ToolResult])
+export type SessionEvent = typeof SessionEvent.Type</code></pre>
+<p class="where"><code>src/history.ts</code></p>
+<pre><code>import type { Message } from "./messages"
+import type { SessionEvent } from "./session-event"
+
+// The messages the next step sends to the model, rebuilt from the session events.
+export const toHistory = (events: ReadonlyArray&lt;SessionEvent&gt;): Message[] =&gt; {
+  const history: Message[] = []
+
+  for (const event of events) {
+    if (event.type === "prompt") {
+      history.push({ role: "user", content: [{ type: "text", text: event.text }] })
+    } else if (event.type === "step-finished") {
+      history.push(event.message)
+    } else {
+      // Results that follow one another belong to one tool message.
+      const last = history.at(-1)
+      if (last?.role === "tool") last.content.push(event.part)
+      else history.push({ role: "tool", content: [event.part] })
+    }
+  }
+  return history
+}</code></pre>
+<p class="where"><code>src/session.ts</code></p>
+<pre><code>import { SqliteClient } from "@effect/sql-sqlite-bun"
+import { asc, eq, max } from "drizzle-orm"
+import * as SQLiteBunDrizzle from "drizzle-orm/effect-sqlite-bun"
+import { migrate } from "drizzle-orm/effect-sqlite-bun/migrator"
+import { Context, Effect, Layer, Schema } from "effect"
+import { SessionCorrupt } from "./errors"
+import { toHistory } from "./history"
+import type { Message } from "./messages"
+import { SessionEvent } from "./session-event"
+import { EventTable } from "./session-table"
+
+// What the agent needs from its session: append a fact, and read the facts back.
+export class Session extends Context.Service&lt;
+  Session,
+  {
+    readonly id: string
+    readonly append: (event: SessionEvent) =&gt; Effect.Effect&lt;void&gt;
+    // Every call reads the log again.
+    readonly events: Effect.Effect&lt;SessionEvent[], SessionCorrupt&gt;
+    readonly history: Effect.Effect&lt;Message[], SessionCorrupt&gt;
+  }
+&gt;()("@agent/Session") {}
+
+const migrationsFolder = new URL("../drizzle", import.meta.url).pathname
+const decode = Schema.decodeUnknownEffect(SessionEvent)
+const encode = Schema.encodeSync(SessionEvent)
+
+// The real session: a SQLite file. Building the layer opens the file and applies the migrations;
+// the end of the program closes it. A disk failure is a defect, not something the agent can handle.
+export const SessionLive = (options: { path: string; id: string }) =&gt;
+  Layer.effect(
+    Session,
+    Effect.gen(function* () {
+      const db = yield* SQLiteBunDrizzle.makeWithDefaults()
+      yield* migrate(db, { migrationsFolder })
+
+      const thisSession = eq(EventTable.session_id, options.id)
+
+      // The numbering continues where the log stops. One process writes a session, so it can count for itself.
+      const [last] = yield* db.select({ seq: max(EventTable.seq) }).from(EventTable).where(thisSession)
+      let seq = last?.seq ?? 0
+
+      // A row that no longer matches the schema stops the read and says which event it was.
+      const readEvent = (row: typeof EventTable.$inferSelect) =&gt;
+        decode(row.data).pipe(
+          Effect.mapError((error) =&gt; new SessionCorrupt({ session: options.id, seq: row.seq, problem: error.message })),
+        )
+
+      const events = db.select().from(EventTable).where(thisSession).orderBy(asc(EventTable.seq)).pipe(
+        Effect.flatMap(Effect.forEach(readEvent)),
+        Effect.catchTag("EffectDrizzleQueryError", Effect.die),
+      )
+
+      const append = (event: SessionEvent) =&gt;
+        Effect.suspend(() =&gt;
+          db.insert(EventTable).values({ session_id: options.id, seq: ++seq, type: event.type, data: encode(event) }),
+        ).pipe(Effect.asVoid, Effect.orDie)
+
+      return Session.of({ id: options.id, append, events, history: Effect.map(events, toHistory) })
+    }).pipe(Effect.orDie),
+  ).pipe(Layer.provide(SqliteClient.layer({ filename: options.path }).pipe(Layer.orDie)))</code></pre>
+</details>
+
+      <h3>Step 3: The agent runs on the log</h3>
+      <p>
+        Now the loop uses the session. Three things change in <code>src/agent.ts</code>: <code>step</code> asks the session for the history and appends its result, the tool loop appends each tool result, and <code>turn</code> and <code>repl</code> stop taking a <code>history</code>. Start with the imports, which gain <code>Session</code> and lose the <code>ToolResultPart</code> type:
+      </p>
+<pre><code>import { Effect, Stream } from "effect"
+import { messageOf } from "./errors"
+import type { FinishReason } from "./events"
+import { isToolCall, type Message, type Part } from "./messages"
+import { ModelClient } from "./model-client"
+import { Session } from "./session"
+import { Terminal } from "./terminal"
+import { runTool, Tools, type Tool } from "./tool"</code></pre>
+      <p>
+        Below the imports, <code>step</code>, <code>turn</code> and <code>repl</code> are replaced by the functions that follow, and <code>run</code> is new. Here is <code>step</code> whole:
+      </p>
+<pre><code>// One step: reload the history from the log, stream the model's events, show the text as it arrives,
+// and append the finished message to the log.
+const step = (tools: Tool[]) =&gt;
+  Effect.gen(function* () {
+    const model = yield* ModelClient
+    const terminal = yield* Terminal
+    const session = yield* Session
+    const history = yield* session.history
+    const content: Part[] = []
+    let text = "" // the text block being written, if any
+    const outcome: { finish: FinishReason; native?: unknown } = { finish: "stop" }
+
+    // A text block ends when anything else arrives, or when the stream does, even by failing.
+    const endText = Effect.suspend(() =&gt; {
+      if (!text) return Effect.void
+      content.push({ type: "text", text })
+      text = ""
+      return terminal.say("")
+    })
+
+    yield* Stream.runForEach(model.chat(history, tools), (event) =&gt;
+      Effect.gen(function* () {
+        if (event.type === "text-delta") {
+          if (!text) yield* terminal.write("Agent: ")
+          text += event.text
+          yield* terminal.write(event.text)
+          return
+        }
+        yield* endText
+        if (event.type === "tool-call") content.push(event)
+        else {
+          outcome.finish = event.reason
+          outcome.native = event.native
+        }
+      }),
+    ).pipe(Effect.ensuring(endText))
+
+    const message: Message = { role: "assistant", content, ...(outcome.native === undefined ? {} : { native: outcome.native }) }
+    yield* session.append({ type: "step-finished", message, finish: outcome.finish })
+    return { message, finish: outcome.finish }
+  })</code></pre>
+      <p>
+        Two things differ from Part 7, and the stream handling in the middle is as it was:
+      </p>
+      <ul>
+        <li><code>step</code> no longer takes the history as an argument. Reading <code>session.history</code> is the first thing it does, and nothing is kept between steps.</li>
+        <li>The finished message is appended before the function returns. The loop reads the tool calls from the message and runs them only after this line, which is the order that makes the table in the first section hold.</li>
+      </ul>
+      <p>
+        <code>run</code> is the loop that was inside <code>turn</code>: steps until the model stops asking for tools. It appends each tool result as soon as that tool finishes, which is why the results are separate events, and it no longer pushes anything into an array:
+      </p>
+<pre><code>// Steps until the model stops asking for tools. Each result is appended as soon as its tool finishes.
+const run = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+  const tools = yield* Tools
+
+  while (true) {
+    const { message, finish } = yield* step(tools)
+    if (finish !== "tool-calls") return
+
+    for (const call of message.content.filter(isToolCall)) {
+      yield* terminal.say(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
+      const part = yield* runTool(call)
+      if (part.result.type === "error") yield* terminal.say(`[error] ${part.result.value}`)
+      yield* session.append({ type: "tool-result", part })
+    }
+  }
+})</code></pre>
+      <p>
+        <code>turn</code> records the prompt and runs it. The two are separate because step 5 needs to run the loop without a new prompt:
+      </p>
+<pre><code>// One prompt: record it, then run steps until the turn is over.
+export const turn = (input: string) =&gt;
+  Effect.gen(function* () {
+    const session = yield* Session
+    yield* session.append({ type: "prompt", text: input })
+    yield* run
+  })</code></pre>
+      <p>
+        <code>repl</code> becomes a value instead of a function, since it has nothing to receive. For now it reports a provider error or a bug and carries on, as before, and the next step handles what the log needs:
+      </p>
+<pre><code>// The read-eval-print loop: read a line from the user, run a turn on it, print the output, and repeat.
+export const repl = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  while (true) {
+    const input = yield* terminal.ask("You: ")
+    yield* turn(input).pipe(
+      Effect.catchTag("ProviderError", (error) =&gt; terminal.say(`[provider error] ${error.message}`)),
+      Effect.catchDefect((defect) =&gt; terminal.say(`[bug] ${messageOf(defect)}`)),
+    )
+  }
+}).pipe(Effect.catchTag("InputClosed", () =&gt; Effect.void))</code></pre>
+      <p>
+        <code>src/index.ts</code> adds the session layer. The agent starts in <code>playground/</code>, which the reset script wipes and the file tools can read, so the default path puts the database one folder up, next to the project. <code>DB_PATH</code> overrides it, in the same way <code>BASE_URL</code> and <code>MODEL</code> override the route, and <code>SESSION</code> names the session. A different name is a separate conversation in the same file:
+      </p>
+<pre><code>import { Effect, Layer } from "effect"
+import { repl } from "./agent"
+import { ModelClientLive } from "./model-client"
+import { SessionLive } from "./session"
+import { TerminalLive } from "./terminal"
+import { ToolsLive } from "./tools"
+
+// The agent starts in playground/, so the default puts the database next to the project, outside the folder it works in.
+const live = Layer.mergeAll(
+  ModelClientLive,
+  TerminalLive,
+  ToolsLive,
+  SessionLive({ path: process.env.DB_PATH ?? "../my-agent.db", id: process.env.SESSION ?? "default" }),
+)
+
+const fail = (error: { message: string }) =&gt;
+  Effect.sync(() =&gt; {
+    console.error(error.message)
+    process.exitCode = 1
+  })
+
+await Effect.runPromise(
+  repl.pipe(
+    Effect.provide(live),
+    Effect.catchTags({ ConfigError: fail, SessionCorrupt: fail }),
+  ),
+)</code></pre>
+      <p>
+        Add the database to <code>.gitignore</code>, with the two files WAL mode adds next to it:
+      </p>
+<pre><code>my-agent.db*</code></pre>
+      <p>
+        The tests need two edits. In <code>test/agent.test.ts</code>, the imports lose <code>Message</code> and gain the session:
+      </p>
+<pre><code>import { describe, expect, test } from "bun:test"
+import { Effect, Layer, Schema } from "effect"
+import { repl } from "../src/agent"
+import { ProviderError } from "../src/errors"
+import { Session, SessionLive } from "../src/session"
+import { defineTool, Tools } from "../src/tool"
+import { callTool, fail, reply, scriptedModel, scriptedTerminal, type Step } from "./fakes"</code></pre>
+      <p>
+        <code>run</code> builds the layers with a session on <code>:memory:</code>, which is SQLite's name for a database that lives only in the process. It is the same code that writes the file, so the tests exercise the real table and migration. After the loop ends, it reads the history and the events back from the session:
+      </p>
+<pre><code>// Runs the loop against a script, on a session kept in memory, and returns what the loop and the fakes saw.
+const run = async (script: { model: Step[]; answers: string[] }) =&gt; {
+  const model = scriptedModel(script.model)
+  const terminal = scriptedTerminal(script.answers)
+  const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo, deleteEverything]), SessionLive({ path: ":memory:", id: "test" }))
+
+  const { history, events } = await Effect.runPromise(
+    Effect.gen(function* () {
+      yield* repl
+      const session = yield* Session
+      return { history: yield* session.history, events: yield* session.events }
+    }).pipe(Effect.provide(layers)),
+  )
+  return { history, events, requests: model.requests, output: terminal.output, writes: terminal.writes }
+}</code></pre>
+      <p>
+        and a test is added for what the log contains after a turn with one tool call:
+      </p>
+<pre><code>  test("appends each fact to the log as it happens", async () =&gt; {
+    const { events } = await run({
+      model: [callTool("call_1", "echo", { text: "hi" }), reply("The tool said hi.")],
+      answers: ["say hi"],
+    })
+
+    expect(events.map((event) =&gt; event.type)).toEqual(["prompt", "step-finished", "tool-result", "step-finished"])
+  })</code></pre>
+      <p>
+        Run the type check and the tests. Two tests fail, and they are the two that cover a turn that fails:
+      </p>
+<pre class="transcript"><code>$ bun test test/agent.test.ts
+test/agent.test.ts:
+81 |     const { history, output } = await run({
+82 |       model: [[{ type: "text-delta", text: "The answer is" }, new ProviderError({ reason: "connection reset" })]],
+83 |       answers: ["hello"],
+84 |     })
+85 | 
+86 |     expect(history).toEqual([])
+                         ^
+error: expect(received).toEqual(expected)
+
+- []
++ [
++   {
++     "content": [
++       {
++         "text": "hello",
++         "type": "text",
++       },
++     ],
++     "role": "user",
++   },
++ ]
+
+- Expected  - 1
++ Received  + 11
+(fail) the agent loop &gt; ends the line of a reply that breaks off, then drops the turn
+(fail) the agent loop &gt; drops a turn whose model call fails
+
+ 4 pass
+ 2 fail</code></pre>
+      <p>
+        Before this step, a failed turn was cut out of the array. Now nothing removes the prompt from the log, so the history still ends with a user message that no step answered. The next step fixes it. The other four tests pass, including the new one.
+      </p>
+      <p>
+        The agent itself already works. Run it on Ollama with one prompt, look at the file, and start it again with a question that only the history can answer:
+      </p>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../src/index.ts
+You: List the files in this folder, then read notes/todo.txt
+[tool] list_files({"path":"."})
+[tool] read_file({"path":"notes/todo.txt"})
+Agent: The files in this folder are:
+- `secret-file.txt`
+- `README.md`
+- `notes/` (directory)
+
+The content of `notes/todo.txt` is:
+- buy milk
+- water the plants
+You: ^D</code></pre>
+<pre class="transcript"><code>$ sqlite3 -header -column my-agent.db "select session_id, seq, type from event"
+session_id  seq  type         
+----------  ---  -------------
+default     1    prompt       
+default     2    step-finished
+default     3    tool-result  
+default     4    step-finished
+default     5    tool-result  
+default     6    step-finished</code></pre>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../src/index.ts
+You: What was the second item in that todo file?
+Agent: The second item in the todo file was "water the plants".
+You: ^D</code></pre>
+      <p>
+        The second process has never seen the todo file. It answers from the six events the first one wrote, rebuilt into the history before its step.
+      </p>
+<details class="reveal">
+<summary>Stuck? The finished agent.ts, index.ts and agent.test.ts for this step</summary>
+<p class="where"><code>src/agent.ts</code></p>
+<pre><code>import { Effect, Stream } from "effect"
+import { messageOf } from "./errors"
+import type { FinishReason } from "./events"
+import { isToolCall, type Message, type Part } from "./messages"
+import { ModelClient } from "./model-client"
+import { Session } from "./session"
+import { Terminal } from "./terminal"
+import { runTool, Tools, type Tool } from "./tool"
+
+// One step: reload the history from the log, stream the model's events, show the text as it arrives,
+// and append the finished message to the log.
+const step = (tools: Tool[]) =&gt;
+  Effect.gen(function* () {
+    const model = yield* ModelClient
+    const terminal = yield* Terminal
+    const session = yield* Session
+    const history = yield* session.history
+    const content: Part[] = []
+    let text = "" // the text block being written, if any
+    const outcome: { finish: FinishReason; native?: unknown } = { finish: "stop" }
+
+    // A text block ends when anything else arrives, or when the stream does, even by failing.
+    const endText = Effect.suspend(() =&gt; {
+      if (!text) return Effect.void
+      content.push({ type: "text", text })
+      text = ""
+      return terminal.say("")
+    })
+
+    yield* Stream.runForEach(model.chat(history, tools), (event) =&gt;
+      Effect.gen(function* () {
+        if (event.type === "text-delta") {
+          if (!text) yield* terminal.write("Agent: ")
+          text += event.text
+          yield* terminal.write(event.text)
+          return
+        }
+        yield* endText
+        if (event.type === "tool-call") content.push(event)
+        else {
+          outcome.finish = event.reason
+          outcome.native = event.native
+        }
+      }),
+    ).pipe(Effect.ensuring(endText))
+
+    const message: Message = { role: "assistant", content, ...(outcome.native === undefined ? {} : { native: outcome.native }) }
+    yield* session.append({ type: "step-finished", message, finish: outcome.finish })
+    return { message, finish: outcome.finish }
+  })
+
+// Steps until the model stops asking for tools. Each result is appended as soon as its tool finishes.
+const run = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+  const tools = yield* Tools
+
+  while (true) {
+    const { message, finish } = yield* step(tools)
+    if (finish !== "tool-calls") return
+
+    for (const call of message.content.filter(isToolCall)) {
+      yield* terminal.say(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
+      const part = yield* runTool(call)
+      if (part.result.type === "error") yield* terminal.say(`[error] ${part.result.value}`)
+      yield* session.append({ type: "tool-result", part })
+    }
+  }
+})
+
+// One prompt: record it, then run steps until the turn is over.
+export const turn = (input: string) =&gt;
+  Effect.gen(function* () {
+    const session = yield* Session
+    yield* session.append({ type: "prompt", text: input })
+    yield* run
+  })
+
+// The read-eval-print loop: read a line from the user, run a turn on it, print the output, and repeat.
+export const repl = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  while (true) {
+    const input = yield* terminal.ask("You: ")
+    yield* turn(input).pipe(
+      Effect.catchTag("ProviderError", (error) =&gt; terminal.say(`[provider error] ${error.message}`)),
+      Effect.catchDefect((defect) =&gt; terminal.say(`[bug] ${messageOf(defect)}`)),
+    )
+  }
+}).pipe(Effect.catchTag("InputClosed", () =&gt; Effect.void))</code></pre>
+<p class="where"><code>src/index.ts</code></p>
+<pre><code>import { Effect, Layer } from "effect"
+import { repl } from "./agent"
+import { ModelClientLive } from "./model-client"
+import { SessionLive } from "./session"
+import { TerminalLive } from "./terminal"
+import { ToolsLive } from "./tools"
+
+// The agent starts in playground/, so the default puts the database next to the project, outside the folder it works in.
+const live = Layer.mergeAll(
+  ModelClientLive,
+  TerminalLive,
+  ToolsLive,
+  SessionLive({ path: process.env.DB_PATH ?? "../my-agent.db", id: process.env.SESSION ?? "default" }),
+)
+
+const fail = (error: { message: string }) =&gt;
+  Effect.sync(() =&gt; {
+    console.error(error.message)
+    process.exitCode = 1
+  })
+
+await Effect.runPromise(
+  repl.pipe(
+    Effect.provide(live),
+    Effect.catchTags({ ConfigError: fail, SessionCorrupt: fail }),
+  ),
+)</code></pre>
+<p class="where"><code>test/agent.test.ts</code></p>
+<pre><code>import { describe, expect, test } from "bun:test"
+import { Effect, Layer, Schema } from "effect"
+import { repl } from "../src/agent"
+import { ProviderError } from "../src/errors"
+import { Session, SessionLive } from "../src/session"
+import { defineTool, Tools } from "../src/tool"
+import { callTool, fail, reply, scriptedModel, scriptedTerminal, type Step } from "./fakes"
+
+// Two small tools, so the tests never touch the disk.
+const echo = defineTool({
+  name: "echo",
+  description: "Returns its text.",
+  input: Schema.Struct({ text: Schema.String }),
+  execute: async ({ text }) =&gt; text,
+})
+
+const deleteEverything = defineTool({
+  name: "delete_everything",
+  description: "Pretends to delete everything.",
+  input: Schema.Struct({}),
+  execute: async () =&gt; "deleted",
+  confirm: () =&gt; "delete everything",
+})
+
+// Runs the loop against a script, on a session kept in memory, and returns what the loop and the fakes saw.
+const run = async (script: { model: Step[]; answers: string[] }) =&gt; {
+  const model = scriptedModel(script.model)
+  const terminal = scriptedTerminal(script.answers)
+  const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo, deleteEverything]), SessionLive({ path: ":memory:", id: "test" }))
+
+  const { history, events } = await Effect.runPromise(
+    Effect.gen(function* () {
+      yield* repl
+      const session = yield* Session
+      return { history: yield* session.history, events: yield* session.events }
+    }).pipe(Effect.provide(layers)),
+  )
+  return { history, events, requests: model.requests, output: terminal.output, writes: terminal.writes }
+}
+
+describe("the agent loop", () =&gt; {
+  test("runs a tool call and then answers", async () =&gt; {
+    const { history, output } = await run({
+      model: [callTool("call_1", "echo", { text: "hi" }), reply("The tool said hi.")],
+      answers: ["say hi"],
+    })
+
+    expect(history.map((message) =&gt; message.role)).toEqual(["user", "assistant", "tool", "assistant"])
+    expect(history[2]?.content).toEqual([{ type: "tool-result", id: "call_1", name: "echo", result: { type: "text", value: "hi" } }])
+    expect(output).toContain("Agent: The tool said hi.")
+  })
+
+  test("appends each fact to the log as it happens", async () =&gt; {
+    const { events } = await run({
+      model: [callTool("call_1", "echo", { text: "hi" }), reply("The tool said hi.")],
+      answers: ["say hi"],
+    })
+
+    expect(events.map((event) =&gt; event.type)).toEqual(["prompt", "step-finished", "tool-result", "step-finished"])
+  })
+
+  test("shows the reply piece by piece", async () =&gt; {
+    const { writes } = await run({ model: [reply("Hello there, friend.")], answers: ["hi"] })
+
+    expect(writes).toEqual(["Agent: ", "Hello ", "there, ", "friend."])
+  })
+
+  test("tells the model when the user declines", async () =&gt; {
+    const { requests } = await run({
+      model: [callTool("call_1", "delete_everything", {}), reply("Understood, I will not delete anything.")],
+      answers: ["clean up", "n"],
+    })
+
+    // The second request is the step after the tool call: its last message holds the result.
+    const result = requests[1]?.at(-1)?.content[0]
+    expect(result).toMatchObject({ type: "tool-result", result: { type: "error" } })
+    expect(JSON.stringify(result)).toContain("User declined")
+  })
+
+  test("ends the line of a reply that breaks off, then drops the turn", async () =&gt; {
+    const { history, output } = await run({
+      model: [[{ type: "text-delta", text: "The answer is" }, new ProviderError({ reason: "connection reset" })]],
+      answers: ["hello"],
+    })
+
+    expect(history).toEqual([])
+    expect(output).toContain("Agent: The answer is")
+    expect(output).toContain("[provider error] connection reset")
+  })
+
+  test("drops a turn whose model call fails", async () =&gt; {
+    const { history, output } = await run({
+      model: [fail("connection refused")],
+      answers: ["hello"],
+    })
+
+    expect(history).toEqual([])
+    expect(output).toContain("[provider error] connection refused")
+  })
+})</code></pre>
+</details>
+
+      <h3>Step 4: A failed turn is an event</h3>
+      <p>
+        Add the fourth event to <code>src/session-event.ts</code>, above <code>SessionEvent</code>:
+      </p>
+<pre><code>// The turn ended in an error. The history leaves the turn out; the log keeps it.
+export const TurnFailed = Schema.Struct({ type: Schema.Literal("turn-failed"), reason: Schema.String })</code></pre>
+      <p>
+        and to the union:
+      </p>
+<pre><code>export const SessionEvent = Schema.Union([Prompt, StepFinished, ToolResult, TurnFailed])</code></pre>
+      <p>
+        Now <code>toHistory</code> has to act on <code>turn-failed</code>. As it reads the events from the oldest to the newest, it keeps a note called <code>turnStart</code>: the position in the message list where the latest prompt was added. When it reaches a <code>turn-failed</code> event, it removes every message from that position onward, so the prompt that failed and anything the turn added after it never reach the model. The events themselves stay in the log. Only the history built from them leaves them out. Part 5 did the same with <code>history.length = before</code>, on a list kept in memory. The finished <code>toHistory</code>:
+      </p>
+<pre><code>import type { Message } from "./messages"
+import type { SessionEvent } from "./session-event"
+
+// The messages the next step sends to the model, rebuilt from the session events.
+export const toHistory = (events: ReadonlyArray&lt;SessionEvent&gt;): Message[] =&gt; {
+  const history: Message[] = []
+  let turnStart = 0 // where the current turn began, so a failed turn can be left out
+
+  for (const event of events) {
+    if (event.type === "prompt") {
+      turnStart = history.length
+      history.push({ role: "user", content: [{ type: "text", text: event.text }] })
+    } else if (event.type === "step-finished") {
+      history.push(event.message)
+    } else if (event.type === "tool-result") {
+      // Results that follow one another belong to one tool message.
+      const last = history.at(-1)
+      if (last?.role === "tool") last.content.push(event.part)
+      else history.push({ role: "tool", content: [event.part] })
+    } else {
+      history.length = turnStart
+    }
+  }
+  return history
+}</code></pre>
+      <p>
+        <code>repl</code> already catches the two ways a turn can fail: a provider error and a bug. It now does one more thing in both cases. A new helper, <code>failed</code>, first appends a <code>turn-failed</code> event to the log and then prints the message to the user. Both <code>catch</code> handlers call it:
+      </p>
+<pre><code>// The read-eval-print loop: read a line from the user, run a turn on it, print the output, and repeat.
+export const repl = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+
+  // A turn that fails is recorded as failed, so the next prompt starts from a consistent history.
+  const failed = (label: string, reason: string) =&gt;
+    session.append({ type: "turn-failed", reason }).pipe(Effect.andThen(terminal.say(`[${label}] ${reason}`)))
+
+  while (true) {
+    const input = yield* terminal.ask("You: ")
+    yield* turn(input).pipe(
+      Effect.catchTag("ProviderError", (error) =&gt; failed("provider error", error.message)),
+      Effect.catchDefect((defect) =&gt; failed("bug", messageOf(defect))),
+    )
+  }
+}).pipe(Effect.catchTag("InputClosed", () =&gt; Effect.void))</code></pre>
+      <p>
+        In <code>test/agent.test.ts</code>, the test of a reply that breaks off also checks what the log holds. Return <code>events</code> from <code>run</code> in its destructuring and add the line that checks them:
+      </p>
+<pre><code>  test("ends the line of a reply that breaks off, then drops the turn", async () =&gt; {
+    const { history, events, output } = await run({
+      model: [[{ type: "text-delta", text: "The answer is" }, new ProviderError({ reason: "connection reset" })]],
+      answers: ["hello"],
+    })
+
+    expect(history).toEqual([])
+    expect(events.map((event) =&gt; event.type)).toEqual(["prompt", "turn-failed"])
+    expect(output).toContain("Agent: The answer is")
+    expect(output).toContain("[provider error] connection reset")
+  })</code></pre>
+      <p>
+        Run the tests. All nineteen pass.
+      </p>
+<pre class="transcript"><code>$ bun test
+bun test v1.4.4 (38afee6c8)
+
+ 19 pass
+ 0 fail
+ 5375 expect() calls
+Ran 19 tests across 3 files. [172.00ms]</code></pre>
+      <p>
+        To see it on a real run, point the agent at a port where nothing listens, then start it again on the same session and send a prompt that the model can answer. The failed prompt is in the file and not in the conversation:
+      </p>
+<pre class="transcript"><code>$ cd playground &amp;&amp; BASE_URL=http://127.0.0.1:1/v1 bun ../src/index.ts
+You: Say hello in five words.
+[provider error] Could not reach http://127.0.0.1:1/v1: ECONNREFUSED: Unable to connect. Is the computer able to access the url?
+You: ^D</code></pre>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../src/index.ts
+You: Say hello in five words.
+Agent: Hello, wonderful friend today.
+You: ^D</code></pre>
+<pre class="transcript"><code>$ sqlite3 -header -column my-agent.db "select seq, type, case type when 'turn-failed' then json_extract(data, '$.reason') else '' end as reason from event"
+seq  type           reason
+---  -------------  ---------------------------------------------------------------------------------------------------------------
+1    prompt
+2    turn-failed    Could not reach http://127.0.0.1:1/v1: ECONNREFUSED: Unable to connect. Is the computer able to access the url?
+3    prompt
+4    step-finished</code></pre>
+      <p>
+        Events 1 and 2 are the failed turn, and events 3 and 4 are the second prompt and its answer. The model that answered saw only the second prompt.
+      </p>
+<details class="reveal">
+<summary>Stuck? The finished session-event.ts, history.ts and the repl in agent.ts for this step</summary>
+<p class="where"><code>src/session-event.ts</code></p>
+<pre><code>import { Schema } from "effect"
+import { Message, ToolResultPart } from "./messages"
+
+// The facts a session records. Nothing here can be worked out from the other events.
+export const Prompt = Schema.Struct({ type: Schema.Literal("prompt"), text: Schema.String })
+
+// One finished model call: the whole assistant message and why the step ended.
+export const StepFinished = Schema.Struct({
+  type: Schema.Literal("step-finished"),
+  message: Message,
+  finish: Schema.Literals(["tool-calls", "stop", "refusal"]),
+})
+
+// One tool call's result. A step with three calls appends three of these, one as soon as each finishes.
+export const ToolResult = Schema.Struct({ type: Schema.Literal("tool-result"), part: ToolResultPart })
+
+// The turn ended in an error. The history leaves the turn out; the log keeps it.
+export const TurnFailed = Schema.Struct({ type: Schema.Literal("turn-failed"), reason: Schema.String })
+
+export const SessionEvent = Schema.Union([Prompt, StepFinished, ToolResult, TurnFailed])
+export type SessionEvent = typeof SessionEvent.Type</code></pre>
+<p class="where"><code>src/history.ts</code></p>
+<pre><code>import type { Message } from "./messages"
+import type { SessionEvent } from "./session-event"
+
+// The messages the next step sends to the model, rebuilt from the session events.
+export const toHistory = (events: ReadonlyArray&lt;SessionEvent&gt;): Message[] =&gt; {
+  const history: Message[] = []
+  let turnStart = 0 // where the current turn began, so a failed turn can be left out
+
+  for (const event of events) {
+    if (event.type === "prompt") {
+      turnStart = history.length
+      history.push({ role: "user", content: [{ type: "text", text: event.text }] })
+    } else if (event.type === "step-finished") {
+      history.push(event.message)
+    } else if (event.type === "tool-result") {
+      // Results that follow one another belong to one tool message.
+      const last = history.at(-1)
+      if (last?.role === "tool") last.content.push(event.part)
+      else history.push({ role: "tool", content: [event.part] })
+    } else {
+      history.length = turnStart
+    }
+  }
+  return history
+}</code></pre>
+<p class="where"><code>src/agent.ts</code></p>
+<pre><code>import { Effect, Stream } from "effect"
+import { messageOf } from "./errors"
+import type { FinishReason } from "./events"
+import { isToolCall, type Message, type Part } from "./messages"
+import { ModelClient } from "./model-client"
+import { Session } from "./session"
+import { Terminal } from "./terminal"
+import { runTool, Tools, type Tool } from "./tool"
+
+// One step: reload the history from the log, stream the model's events, show the text as it arrives,
+// and append the finished message to the log.
+const step = (tools: Tool[]) =&gt;
+  Effect.gen(function* () {
+    const model = yield* ModelClient
+    const terminal = yield* Terminal
+    const session = yield* Session
+    const history = yield* session.history
+    const content: Part[] = []
+    let text = "" // the text block being written, if any
+    const outcome: { finish: FinishReason; native?: unknown } = { finish: "stop" }
+
+    // A text block ends when anything else arrives, or when the stream does, even by failing.
+    const endText = Effect.suspend(() =&gt; {
+      if (!text) return Effect.void
+      content.push({ type: "text", text })
+      text = ""
+      return terminal.say("")
+    })
+
+    yield* Stream.runForEach(model.chat(history, tools), (event) =&gt;
+      Effect.gen(function* () {
+        if (event.type === "text-delta") {
+          if (!text) yield* terminal.write("Agent: ")
+          text += event.text
+          yield* terminal.write(event.text)
+          return
+        }
+        yield* endText
+        if (event.type === "tool-call") content.push(event)
+        else {
+          outcome.finish = event.reason
+          outcome.native = event.native
+        }
+      }),
+    ).pipe(Effect.ensuring(endText))
+
+    const message: Message = { role: "assistant", content, ...(outcome.native === undefined ? {} : { native: outcome.native }) }
+    yield* session.append({ type: "step-finished", message, finish: outcome.finish })
+    return { message, finish: outcome.finish }
+  })
+
+// Steps until the model stops asking for tools. Each result is appended as soon as its tool finishes.
+const run = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+  const tools = yield* Tools
+
+  while (true) {
+    const { message, finish } = yield* step(tools)
+    if (finish !== "tool-calls") return
+
+    for (const call of message.content.filter(isToolCall)) {
+      yield* terminal.say(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
+      const part = yield* runTool(call)
+      if (part.result.type === "error") yield* terminal.say(`[error] ${part.result.value}`)
+      yield* session.append({ type: "tool-result", part })
+    }
+  }
+})
+
+// One prompt: record it, then run steps until the turn is over.
+export const turn = (input: string) =&gt;
+  Effect.gen(function* () {
+    const session = yield* Session
+    yield* session.append({ type: "prompt", text: input })
+    yield* run
+  })
+
+// The read-eval-print loop: read a line from the user, run a turn on it, print the output, and repeat.
+export const repl = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+
+  // A turn that fails is recorded as failed, so the next prompt starts from a consistent history.
+  const failed = (label: string, reason: string) =&gt;
+    session.append({ type: "turn-failed", reason }).pipe(Effect.andThen(terminal.say(`[${label}] ${reason}`)))
+
+  while (true) {
+    const input = yield* terminal.ask("You: ")
+    yield* turn(input).pipe(
+      Effect.catchTag("ProviderError", (error) =&gt; failed("provider error", error.message)),
+      Effect.catchDefect((defect) =&gt; failed("bug", messageOf(defect))),
+    )
+  }
+}).pipe(Effect.catchTag("InputClosed", () =&gt; Effect.void))</code></pre>
+</details>
+
+      <h3>Step 5: Resume what the last run left unfinished</h3>
+      <p>
+        <code>unansweredCalls</code> tells a restart where the last turn stopped. It looks at the end of the history and returns <code>undefined</code> if the turn finished, an empty list if the model has to answer next (the history ends with the user's message, or with tool results for every call), and the tool calls that have no result otherwise. In <code>src/history.ts</code>, change the import and add the function below <code>toHistory</code>:
+      </p>
+<pre><code>import { isToolCall, type Message, type ToolCallPart } from "./messages"</code></pre>
+<pre><code>// What a restart finds when the last turn did not finish: the tool calls of the last step that have no result yet.
+// Returns undefined when the turn did finish, and an empty list when the model simply has to answer next.
+export const unansweredCalls = (history: ReadonlyArray&lt;Message&gt;): ToolCallPart[] | undefined =&gt; {
+  const last = history.at(-1)
+  if (!last) return undefined
+  if (last.role === "user") return []
+  const assistant = last.role === "tool" ? history.at(-2) : last
+  const calls = assistant?.content.filter(isToolCall) ?? []
+  if (last.role === "assistant" &amp;&amp; calls.length === 0) return undefined
+  const answered = last.role === "tool" ? last.content.flatMap((part) =&gt; (part.type === "tool-result" ? [part.id] : [])) : []
+  return calls.filter((call) =&gt; !answered.includes(call.id))
+}</code></pre>
+      <p>
+        In <code>src/agent.ts</code>, the imports gain <code>unansweredCalls</code> and the types that the next change uses:
+      </p>
+<pre><code>import { Effect, Stream } from "effect"
+import { messageOf, type InputClosed, type ProviderError, type SessionCorrupt } from "./errors"
+import type { FinishReason } from "./events"
+import { unansweredCalls } from "./history"
+import { isToolCall, type Message, type Part } from "./messages"
+import { ModelClient } from "./model-client"
+import { Session } from "./session"
+import { Terminal } from "./terminal"
+import { runTool, Tools, type Tool } from "./tool"</code></pre>
+      <p>
+        <code>resume</code> goes above <code>repl</code>. If the last turn is unfinished, it says so, appends the interrupted result for each unanswered call, and runs the loop. It does not run the interrupted tools. It prints each of them, so the user can see what the model is going to be told about:
+      </p>
+<pre><code>const interrupted =
+  "The agent stopped before this tool finished, so it may or may not have run. Check the current state before repeating it."
+
+// A restart can find a turn that did not finish. Tool calls without a result get an error result instead of
+// running again, since a command that already ran must not run twice. Then the turn continues.
+const resume = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+  const calls = unansweredCalls(yield* session.history)
+  if (calls === undefined) return
+
+  yield* terminal.say(`[resuming session ${session.id}]`)
+  for (const call of calls) {
+    yield* terminal.say(`[interrupted] ${call.name}(${JSON.stringify(call.input)})`)
+    yield* session.append({
+      type: "tool-result",
+      part: { type: "tool-result", id: call.id, name: call.name, result: { type: "error", value: interrupted } },
+    })
+  }
+  yield* run
+})</code></pre>
+      <p>
+        <code>repl</code> runs <code>resume</code> first and then reads prompts. Both go through <code>guarded</code>, so a provider error during a resumed turn is recorded and reported like any other. The two handlers from step 4 move into it:
+      </p>
+<pre><code>// The read-eval-print loop: finish an interrupted turn, then read a line from the user, run a turn on it,
+// print the output, and repeat.
+export const repl = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+
+  // A turn that fails is recorded as failed, so the next prompt starts from a consistent history.
+  const failed = (label: string, reason: string) =&gt;
+    session.append({ type: "turn-failed", reason }).pipe(Effect.andThen(terminal.say(`[${label}] ${reason}`)))
+  const guarded = &lt;R&gt;(work: Effect.Effect&lt;void, ProviderError | SessionCorrupt | InputClosed, R&gt;) =&gt;
+    work.pipe(
+      Effect.catchTag("ProviderError", (error) =&gt; failed("provider error", error.message)),
+      Effect.catchDefect((defect) =&gt; failed("bug", messageOf(defect))),
+    )
+
+  yield* guarded(resume)
+  while (true) {
+    const input = yield* terminal.ask("You: ")
+    yield* guarded(turn(input))
+  }
+}).pipe(Effect.catchTag("InputClosed", () =&gt; Effect.void))</code></pre>
+      <p>
+        The tests for this step write the log that a dead process leaves, close the file, and start a new agent on it. <code>crashAfter</code> is the first process: it appends the given events to a file and ends, as a crash would. <code>restart</code> is the second: a new set of layers on the same file, with a scripted model and a terminal that has no input, so the agent can only finish what it finds. Create <code>test/resume.test.ts</code>:
+      </p>
+<pre><code>import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { Effect, Layer, Schema } from "effect"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { repl } from "../src/agent"
+import type { SessionEvent } from "../src/session-event"
+import { Session, SessionLive } from "../src/session"
+import { defineTool, Tools } from "../src/tool"
+import { callTool, reply, scriptedModel, scriptedTerminal } from "./fakes"
+
+// A crash leaves the log as it was at the moment the process died. These tests write that log with
+// `append`, close the file, and start the agent again on it.
+let dir: string
+beforeEach(async () =&gt; {
+  dir = await mkdtemp(join(tmpdir(), "agent-session-"))
+})
+afterEach(() =&gt; rm(dir, { recursive: true, force: true }))
+
+const ran: string[] = []
+const echo = defineTool({
+  name: "echo",
+  description: "Returns its text.",
+  input: Schema.Struct({ text: Schema.String }),
+  execute: async ({ text }) =&gt; (ran.push(text), text),
+})
+
+const prompt = (text: string): SessionEvent =&gt; ({ type: "prompt", text })
+const calls = (...ids: string[]): SessionEvent =&gt; ({
+  type: "step-finished",
+  message: { role: "assistant", content: ids.map((id) =&gt; ({ type: "tool-call", id, name: "echo", input: { text: id } })) },
+  finish: "tool-calls",
+})
+const result = (id: string): SessionEvent =&gt; ({
+  type: "tool-result",
+  part: { type: "tool-result", id, name: "echo", result: { type: "text", value: id } },
+})
+
+// Process one: the events that were written before the crash.
+const crashAfter = (events: SessionEvent[]) =&gt;
+  Effect.runPromise(
+    Effect.gen(function* () {
+      const session = yield* Session
+      for (const event of events) yield* session.append(event)
+    }).pipe(Effect.provide(SessionLive({ path: join(dir, "agent.db"), id: "s" }))),
+  )
+
+// Process two: a new agent on the same file. No input, so it only finishes what it finds.
+const restart = async (modelSteps: Parameters&lt;typeof scriptedModel&gt;[0]) =&gt; {
+  const model = scriptedModel(modelSteps)
+  const terminal = scriptedTerminal([])
+  const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo]), SessionLive({ path: join(dir, "agent.db"), id: "s" }))
+  const events = await Effect.runPromise(
+    Effect.gen(function* () {
+      yield* repl
+      return yield* (yield* Session).events
+    }).pipe(Effect.provide(layers)),
+  )
+  return { events, requests: model.requests, output: terminal.output }
+}
+
+describe("resuming a session", () =&gt; {
+  test("answers a call that has no result with an error and never runs it again", async () =&gt; {
+    ran.length = 0
+    await crashAfter([prompt("go"), calls("a", "b"), result("a")])
+
+    const { events, requests, output } = await restart([reply("Understood.")])
+
+    expect(output[0]).toBe("[resuming session s]")
+    expect(ran).toEqual([])
+    const tool = requests[0]?.at(-1)
+    expect(tool?.role).toBe("tool")
+    expect(tool?.content.map((part) =&gt; (part.type === "tool-result" ? [part.id, part.result.type] : []))).toEqual([
+      ["a", "text"],
+      ["b", "error"],
+    ])
+    expect(JSON.stringify(tool)).toContain("stopped before this tool finished")
+    expect(events.map((event) =&gt; event.type)).toEqual(["prompt", "step-finished", "tool-result", "tool-result", "step-finished"])
+  })
+
+  test("continues a turn that stopped right after the prompt", async () =&gt; {
+    await crashAfter([prompt("hello")])
+
+    const { requests, output } = await restart([reply("Hi.")])
+
+    expect(output).toContain("Agent: Hi.")
+    expect(requests[0]?.map((message) =&gt; message.role)).toEqual(["user"])
+  })
+
+  test("continues a turn that stopped between the last result and the next step", async () =&gt; {
+    await crashAfter([prompt("go"), calls("a"), result("a")])
+
+    const { requests } = await restart([reply("Done.")])
+
+    expect(requests[0]?.map((message) =&gt; message.role)).toEqual(["user", "assistant", "tool"])
+  })
+
+  test("leaves a finished turn alone", async () =&gt; {
+    await crashAfter([prompt("hi"), { type: "step-finished", message: { role: "assistant", content: [{ type: "text", text: "Hello." }] }, finish: "stop" }])
+
+    const { requests, output } = await restart([])
+
+    expect(requests).toEqual([])
+    expect(output.join("\n")).not.toContain("resuming")
+  })
+
+  test("leaves a failed turn alone", async () =&gt; {
+    await crashAfter([prompt("hi"), { type: "turn-failed", reason: "connection reset" }])
+
+    const { requests, output } = await restart([])
+
+    expect(requests).toEqual([])
+    expect(output.join("\n")).not.toContain("resuming")
+  })
+
+  test("a resumed turn that calls a tool runs it like any other", async () =&gt; {
+    ran.length = 0
+    await crashAfter([prompt("go")])
+
+    await restart([callTool("c9", "echo", { text: "again" }), reply("Done.")])
+
+    expect(ran).toEqual(["again"])
+  })
+})</code></pre>
+      <p>
+        The first test is the one in the table of the first section: two calls, one result, and the process gone. It checks that the message announces the resume, that no tool ran, that the model's request ends with a tool message whose second result is the error, and the final shape of the log. Run the tests:
+      </p>
+<pre class="transcript"><code>$ bun test
+bun test v1.4.4 (38afee6c8)
+
+ 25 pass
+ 0 fail
+ 5389 expect() calls
+Ran 25 tests across 4 files. [218.00ms]</code></pre>
+<details class="reveal">
+<summary>Stuck? The finished history.ts and agent.ts</summary>
+<p class="where"><code>src/history.ts</code></p>
+<pre><code>import { isToolCall, type Message, type ToolCallPart } from "./messages"
+import type { SessionEvent } from "./session-event"
+
+// The messages the next step sends to the model, rebuilt from the session events.
+export const toHistory = (events: ReadonlyArray&lt;SessionEvent&gt;): Message[] =&gt; {
+  const history: Message[] = []
+  let turnStart = 0 // where the current turn began, so a failed turn can be left out
+
+  for (const event of events) {
+    if (event.type === "prompt") {
+      turnStart = history.length
+      history.push({ role: "user", content: [{ type: "text", text: event.text }] })
+    } else if (event.type === "step-finished") {
+      history.push(event.message)
+    } else if (event.type === "tool-result") {
+      // Results that follow one another belong to one tool message.
+      const last = history.at(-1)
+      if (last?.role === "tool") last.content.push(event.part)
+      else history.push({ role: "tool", content: [event.part] })
+    } else {
+      history.length = turnStart
+    }
+  }
+  return history
+}
+
+// What a restart finds when the last turn did not finish: the tool calls of the last step that have no result yet.
+// Returns undefined when the turn did finish, and an empty list when the model simply has to answer next.
+export const unansweredCalls = (history: ReadonlyArray&lt;Message&gt;): ToolCallPart[] | undefined =&gt; {
+  const last = history.at(-1)
+  if (!last) return undefined
+  if (last.role === "user") return []
+  const assistant = last.role === "tool" ? history.at(-2) : last
+  const calls = assistant?.content.filter(isToolCall) ?? []
+  if (last.role === "assistant" &amp;&amp; calls.length === 0) return undefined
+  const answered = last.role === "tool" ? last.content.flatMap((part) =&gt; (part.type === "tool-result" ? [part.id] : [])) : []
+  return calls.filter((call) =&gt; !answered.includes(call.id))
+}</code></pre>
+<p class="where"><code>src/agent.ts</code></p>
+<pre><code>import { Effect, Stream } from "effect"
+import { messageOf, type InputClosed, type ProviderError, type SessionCorrupt } from "./errors"
+import type { FinishReason } from "./events"
+import { unansweredCalls } from "./history"
+import { isToolCall, type Message, type Part } from "./messages"
+import { ModelClient } from "./model-client"
+import { Session } from "./session"
+import { Terminal } from "./terminal"
+import { runTool, Tools, type Tool } from "./tool"
+
+// One step: reload the history from the log, stream the model's events, show the text as it arrives,
+// and append the finished message to the log.
+const step = (tools: Tool[]) =&gt;
+  Effect.gen(function* () {
+    const model = yield* ModelClient
+    const terminal = yield* Terminal
+    const session = yield* Session
+    const history = yield* session.history
+    const content: Part[] = []
+    let text = "" // the text block being written, if any
+    const outcome: { finish: FinishReason; native?: unknown } = { finish: "stop" }
+
+    // A text block ends when anything else arrives, or when the stream does, even by failing.
+    const endText = Effect.suspend(() =&gt; {
+      if (!text) return Effect.void
+      content.push({ type: "text", text })
+      text = ""
+      return terminal.say("")
+    })
+
+    yield* Stream.runForEach(model.chat(history, tools), (event) =&gt;
+      Effect.gen(function* () {
+        if (event.type === "text-delta") {
+          if (!text) yield* terminal.write("Agent: ")
+          text += event.text
+          yield* terminal.write(event.text)
+          return
+        }
+        yield* endText
+        if (event.type === "tool-call") content.push(event)
+        else {
+          outcome.finish = event.reason
+          outcome.native = event.native
+        }
+      }),
+    ).pipe(Effect.ensuring(endText))
+
+    const message: Message = { role: "assistant", content, ...(outcome.native === undefined ? {} : { native: outcome.native }) }
+    yield* session.append({ type: "step-finished", message, finish: outcome.finish })
+    return { message, finish: outcome.finish }
+  })
+
+// Steps until the model stops asking for tools. Each result is appended as soon as its tool finishes.
+const run = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+  const tools = yield* Tools
+
+  while (true) {
+    const { message, finish } = yield* step(tools)
+    if (finish !== "tool-calls") return
+
+    for (const call of message.content.filter(isToolCall)) {
+      yield* terminal.say(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
+      const part = yield* runTool(call)
+      if (part.result.type === "error") yield* terminal.say(`[error] ${part.result.value}`)
+      yield* session.append({ type: "tool-result", part })
+    }
+  }
+})
+
+// One prompt: record it, then run steps until the turn is over.
+export const turn = (input: string) =&gt;
+  Effect.gen(function* () {
+    const session = yield* Session
+    yield* session.append({ type: "prompt", text: input })
+    yield* run
+  })
+
+const interrupted =
+  "The agent stopped before this tool finished, so it may or may not have run. Check the current state before repeating it."
+
+// A restart can find a turn that did not finish. Tool calls without a result get an error result instead of
+// running again, since a command that already ran must not run twice. Then the turn continues.
+const resume = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+  const calls = unansweredCalls(yield* session.history)
+  if (calls === undefined) return
+
+  yield* terminal.say(`[resuming session ${session.id}]`)
+  for (const call of calls) {
+    yield* terminal.say(`[interrupted] ${call.name}(${JSON.stringify(call.input)})`)
+    yield* session.append({
+      type: "tool-result",
+      part: { type: "tool-result", id: call.id, name: call.name, result: { type: "error", value: interrupted } },
+    })
+  }
+  yield* run
+})
+
+// The read-eval-print loop: finish an interrupted turn, then read a line from the user, run a turn on it,
+// print the output, and repeat.
+export const repl = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+
+  // A turn that fails is recorded as failed, so the next prompt starts from a consistent history.
+  const failed = (label: string, reason: string) =&gt;
+    session.append({ type: "turn-failed", reason }).pipe(Effect.andThen(terminal.say(`[${label}] ${reason}`)))
+  const guarded = &lt;R&gt;(work: Effect.Effect&lt;void, ProviderError | SessionCorrupt | InputClosed, R&gt;) =&gt;
+    work.pipe(
+      Effect.catchTag("ProviderError", (error) =&gt; failed("provider error", error.message)),
+      Effect.catchDefect((defect) =&gt; failed("bug", messageOf(defect))),
+    )
+
+  yield* guarded(resume)
+  while (true) {
+    const input = yield* terminal.ask("You: ")
+    yield* guarded(turn(input))
+  }
+}).pipe(Effect.catchTag("InputClosed", () =&gt; Effect.void))</code></pre>
+</details>
+
+      <h3>Step 6: Test the fold and the file, then break them</h3>
+      <p>
+        Two more test files cover the parts that the loop tests only touch. <code>test/history.test.ts</code> runs the fold and <code>unansweredCalls</code> on lists of events, with no database:
+      </p>
+<pre><code>import { describe, expect, test } from "bun:test"
+import { toHistory, unansweredCalls } from "../src/history"
+import type { ToolResultPart } from "../src/messages"
+import type { SessionEvent } from "../src/session-event"
+
+const prompt = (text: string): SessionEvent =&gt; ({ type: "prompt", text })
+const answer = (text: string): SessionEvent =&gt; ({
+  type: "step-finished",
+  message: { role: "assistant", content: [{ type: "text", text }] },
+  finish: "stop",
+})
+const calls = (...ids: string[]): SessionEvent =&gt; ({
+  type: "step-finished",
+  message: { role: "assistant", content: ids.map((id) =&gt; ({ type: "tool-call", id, name: "echo", input: {} })) },
+  finish: "tool-calls",
+})
+const result = (id: string): SessionEvent =&gt; {
+  const part: ToolResultPart = { type: "tool-result", id, name: "echo", result: { type: "text", value: id } }
+  return { type: "tool-result", part }
+}
+const failed: SessionEvent = { type: "turn-failed", reason: "connection reset" }
+
+describe("toHistory", () =&gt; {
+  test("turns events into messages in order", () =&gt; {
+    const history = toHistory([prompt("hi"), answer("hello")])
+
+    expect(history.map((message) =&gt; message.role)).toEqual(["user", "assistant"])
+  })
+
+  test("puts results that follow one another in one tool message", () =&gt; {
+    const history = toHistory([prompt("go"), calls("a", "b"), result("a"), result("b")])
+
+    expect(history.map((message) =&gt; message.role)).toEqual(["user", "assistant", "tool"])
+    expect(history[2]?.content).toHaveLength(2)
+  })
+
+  test("leaves out a failed turn and keeps the turns before it", () =&gt; {
+    const history = toHistory([prompt("one"), answer("first"), prompt("two"), calls("a"), failed, prompt("three")])
+
+    expect(history.map((message) =&gt; message.role)).toEqual(["user", "assistant", "user"])
+  })
+})
+
+describe("unansweredCalls", () =&gt; {
+  test("is undefined when the last turn finished", () =&gt; {
+    expect(unansweredCalls(toHistory([prompt("hi"), answer("hello")]))).toBeUndefined()
+    expect(unansweredCalls(toHistory([prompt("hi"), failed]))).toBeUndefined()
+    expect(unansweredCalls([])).toBeUndefined()
+  })
+
+  test("is empty when the model has to answer next", () =&gt; {
+    expect(unansweredCalls(toHistory([prompt("hi")]))).toEqual([])
+    expect(unansweredCalls(toHistory([prompt("hi"), calls("a"), result("a")]))).toEqual([])
+  })
+
+  test("lists the calls that have no result", () =&gt; {
+    expect(unansweredCalls(toHistory([prompt("go"), calls("a", "b")]))?.map((call) =&gt; call.id)).toEqual(["a", "b"])
+    expect(unansweredCalls(toHistory([prompt("go"), calls("a", "b"), result("a")]))?.map((call) =&gt; call.id)).toEqual(["b"])
+  })
+})</code></pre>
+      <p>
+        <code>test/session.test.ts</code> covers the file itself: events come back in order after the file is closed and opened again, two sessions in one file stay apart, and a row that does not match the Schema fails with a <code>SessionCorrupt</code> that names the row. The third test writes the bad row with <code>bun:sqlite</code> directly, as someone editing the file by hand would:
+      </p>
+<pre><code>import { Database } from "bun:sqlite"
+import { afterEach, beforeEach, expect, test } from "bun:test"
+import { Effect } from "effect"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { SessionCorrupt } from "../src/errors"
+import { Session, SessionLive } from "../src/session"
+
+let path: string
+let dir: string
+beforeEach(async () =&gt; {
+  dir = await mkdtemp(join(tmpdir(), "agent-session-"))
+  path = join(dir, "agent.db")
+})
+afterEach(() =&gt; rm(dir, { recursive: true, force: true }))
+
+// Opens the file, runs `use`, and closes the file again, like one run of the agent.
+const using = &lt;A, E&gt;(id: string, use: (session: Session["Service"]) =&gt; Effect.Effect&lt;A, E&gt;) =&gt;
+  Effect.runPromise(Effect.gen(function* () { return yield* use(yield* Session) }).pipe(Effect.provide(SessionLive({ path, id }))))
+
+test("reads back what was appended, in order, after the file is closed and opened again", async () =&gt; {
+  await using("s", (session) =&gt; session.append({ type: "prompt", text: "one" }).pipe(Effect.andThen(session.append({ type: "prompt", text: "two" }))))
+
+  const events = await using("s", (session) =&gt; session.events)
+
+  expect(events).toEqual([
+    { type: "prompt", text: "one" },
+    { type: "prompt", text: "two" },
+  ])
+})
+
+test("keeps the events of two sessions apart", async () =&gt; {
+  await using("a", (session) =&gt; session.append({ type: "prompt", text: "for a" }))
+  await using("b", (session) =&gt; session.append({ type: "prompt", text: "for b" }))
+
+  expect(await using("b", (session) =&gt; session.events)).toEqual([{ type: "prompt", text: "for b" }])
+})
+
+test("names the event that does not match the schema", async () =&gt; {
+  await using("s", (session) =&gt; session.append({ type: "prompt", text: "hi" }))
+  const db = new Database(path)
+  db.run(`insert into event (session_id, seq, type, data) values ('s', 2, 'prompt', '{"type":"prompt"}')`)
+  db.close()
+
+  const error = await using("s", (session) =&gt; Effect.flip(session.events))
+
+  expect(error).toBeInstanceOf(SessionCorrupt)
+  expect(error).toMatchObject({ session: "s", seq: 2 })
+})</code></pre>
+<pre class="transcript"><code>$ bun test
+bun test v1.4.4 (38afee6c8)
+
+ 34 pass
+ 0 fail
+ 5404 expect() calls
+Ran 34 tests across 6 files. [229.00ms]</code></pre>
+      <p>
+        <strong>Make the tests fail.</strong> The rule behind this part is that the loop reads the history from the file. Break it. In <code>agent.ts</code>, give the loop its own array again: a <code>const memory: Message[] = []</code> above <code>step</code>, <code>step</code> reads <code>memory</code> in place of <code>session.history</code>, and every <code>append</code> in <code>turn</code>, <code>step</code> and <code>run</code> is preceded by a <code>memory.push</code> of the same message. That is Part 7's loop with a log written beside it. The loop tests still pass, because within one run the array and the file agree. The three tests that start from a log written by another process fail:
+      </p>
+<pre class="transcript"><code>(fail) resuming a session &gt; answers a call that has no result with an error and never runs it again [15.99ms]
+(fail) resuming a session &gt; continues a turn that stopped right after the prompt [6.91ms]
+(fail) resuming a session &gt; continues a turn that stopped between the last result and the next step [7.94ms]
+ 31 pass
+ 3 fail</code></pre>
+      <p>
+        Put it back. Then, in <code>toHistory</code>, delete the line <code>history.length = turnStart</code>. A failed turn now stays in the history:
+      </p>
+<pre class="transcript"><code>(fail) toHistory &gt; leaves out a failed turn and keeps the turns before it [0.17ms]
+(fail) unansweredCalls &gt; is undefined when the last turn finished [0.07ms]
+(fail) resuming a session &gt; leaves a failed turn alone [6.55ms]
+(fail) the agent loop &gt; ends the line of a reply that breaks off, then drops the turn [0.84ms]
+(fail) the agent loop &gt; drops a turn whose model call fails [0.84ms]
+ 29 pass
+ 5 fail</code></pre>
+      <p>
+        The two loop tests of a failed turn fail, and so does the fold's own test. So do the two tests that expect a failed turn to need no resume: with the turn left in the history, it ends in a user message, which looks like an unfinished turn.
+      </p>
+<details class="reveal">
+<summary>Stuck? The finished agent.test.ts</summary>
+<p class="where"><code>test/agent.test.ts</code></p>
+<pre><code>import { describe, expect, test } from "bun:test"
+import { Effect, Layer, Schema } from "effect"
+import { repl } from "../src/agent"
+import { ProviderError } from "../src/errors"
+import { Session, SessionLive } from "../src/session"
+import { defineTool, Tools } from "../src/tool"
+import { callTool, fail, reply, scriptedModel, scriptedTerminal, type Step } from "./fakes"
+
+// Two small tools, so the tests never touch the disk.
+const echo = defineTool({
+  name: "echo",
+  description: "Returns its text.",
+  input: Schema.Struct({ text: Schema.String }),
+  execute: async ({ text }) =&gt; text,
+})
+
+const deleteEverything = defineTool({
+  name: "delete_everything",
+  description: "Pretends to delete everything.",
+  input: Schema.Struct({}),
+  execute: async () =&gt; "deleted",
+  confirm: () =&gt; "delete everything",
+})
+
+// Runs the loop against a script, on a session kept in memory, and returns what the loop and the fakes saw.
+const run = async (script: { model: Step[]; answers: string[] }) =&gt; {
+  const model = scriptedModel(script.model)
+  const terminal = scriptedTerminal(script.answers)
+  const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo, deleteEverything]), SessionLive({ path: ":memory:", id: "test" }))
+
+  const { history, events } = await Effect.runPromise(
+    Effect.gen(function* () {
+      yield* repl
+      const session = yield* Session
+      return { history: yield* session.history, events: yield* session.events }
+    }).pipe(Effect.provide(layers)),
+  )
+  return { history, events, requests: model.requests, output: terminal.output, writes: terminal.writes }
+}
+
+describe("the agent loop", () =&gt; {
+  test("runs a tool call and then answers", async () =&gt; {
+    const { history, output } = await run({
+      model: [callTool("call_1", "echo", { text: "hi" }), reply("The tool said hi.")],
+      answers: ["say hi"],
+    })
+
+    expect(history.map((message) =&gt; message.role)).toEqual(["user", "assistant", "tool", "assistant"])
+    expect(history[2]?.content).toEqual([{ type: "tool-result", id: "call_1", name: "echo", result: { type: "text", value: "hi" } }])
+    expect(output).toContain("Agent: The tool said hi.")
+  })
+
+  test("appends each fact to the log as it happens", async () =&gt; {
+    const { events } = await run({
+      model: [callTool("call_1", "echo", { text: "hi" }), reply("The tool said hi.")],
+      answers: ["say hi"],
+    })
+
+    expect(events.map((event) =&gt; event.type)).toEqual(["prompt", "step-finished", "tool-result", "step-finished"])
+  })
+
+  test("shows the reply piece by piece", async () =&gt; {
+    const { writes } = await run({ model: [reply("Hello there, friend.")], answers: ["hi"] })
+
+    expect(writes).toEqual(["Agent: ", "Hello ", "there, ", "friend."])
+  })
+
+  test("tells the model when the user declines", async () =&gt; {
+    const { requests } = await run({
+      model: [callTool("call_1", "delete_everything", {}), reply("Understood, I will not delete anything.")],
+      answers: ["clean up", "n"],
+    })
+
+    // The second request is the step after the tool call: its last message holds the result.
+    const result = requests[1]?.at(-1)?.content[0]
+    expect(result).toMatchObject({ type: "tool-result", result: { type: "error" } })
+    expect(JSON.stringify(result)).toContain("User declined")
+  })
+
+  test("ends the line of a reply that breaks off, then drops the turn", async () =&gt; {
+    const { history, events, output } = await run({
+      model: [[{ type: "text-delta", text: "The answer is" }, new ProviderError({ reason: "connection reset" })]],
+      answers: ["hello"],
+    })
+
+    expect(history).toEqual([])
+    expect(events.map((event) =&gt; event.type)).toEqual(["prompt", "turn-failed"])
+    expect(output).toContain("Agent: The answer is")
+    expect(output).toContain("[provider error] connection reset")
+  })
+
+  test("drops a turn whose model call fails", async () =&gt; {
+    const { history, output } = await run({
+      model: [fail("connection refused")],
+      answers: ["hello"],
+    })
+
+    expect(history).toEqual([])
+    expect(output).toContain("[provider error] connection refused")
+  })
+})</code></pre>
+</details>
+
+      <h3>Step 7: Kill it and run it live</h3>
+      <p>
+        <strong>A real crash.</strong> The tests write the log by hand. This run produces one. Start the agent and ask for a command that takes fifteen seconds. Confirm it with <code>y</code>, and while it runs, kill the process from a second terminal with <code>pkill -9 -f 'bun ../src/index.ts'</code>. Signal 9, SIGKILL, cannot be caught: the process gets no chance to run any code before it ends.
+      </p>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../src/index.ts
+You: Run the shell command: sleep 15 &amp;&amp; echo done &gt; notes/finished.txt
+[tool] bash({"command":"sleep 15 &amp;&amp; echo done &gt; notes/finished.txt"})
+Allow: run: sleep 15 &amp;&amp; echo done &gt; notes/finished.txt? [y/N] y
+error: script "start" was terminated by signal SIGKILL (Forced quit)</code></pre>
+      <p>
+        The file has the prompt and the step that asked for the command, and no result:
+      </p>
+<pre class="transcript"><code>$ sqlite3 my-agent.db "select seq || ' ' || type from event"
+1 prompt
+2 step-finished</code></pre>
+      <p>
+        Start the agent again, with no input this time. It finds the unfinished turn, tells the model that the command was interrupted, and the model reacts. It wants to check the file and to run the command again, and since there is no input here, the confirmation prompts are declined:
+      </p>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../src/index.ts
+[resuming session default]
+[interrupted] bash({"command":"sleep 15 &amp;&amp; echo done &gt; notes/finished.txt"})
+Agent: Let me check if the file was created:
+[tool] bash({"command":"cat notes/finished.txt 2&gt;/dev/null || echo \"File not found\""})
+[error] User declined this action. Ask what they would like instead.
+Agent: It seems the shell command execution was interrupted. Let me try running it again:
+[tool] bash({"command":"sleep 15 &amp;&amp; echo done &gt; notes/finished.txt"})
+[error] User declined this action. Ask what they would like instead.
+Agent: I'm unable to execute the shell command as requested. Instead, I can create the file directly using the file tools. Would you like me to create a file `notes/finished.txt` with the content "done" instead?
+You: ^D</code></pre>
+      <p>
+        The log now has the interrupted result and the model's steps after it:
+      </p>
+<pre class="transcript"><code>$ sqlite3 my-agent.db "select seq || ' ' || type from event"
+1 prompt
+2 step-finished
+3 tool-result
+4 step-finished
+5 tool-result
+6 step-finished
+7 tool-result
+8 step-finished</code></pre>
+      <p>
+        The shell that the agent started kept running after the agent was killed. Twenty seconds after the kill:
+      </p>
+<pre class="transcript"><code>$ ls playground/notes
+finished.txt  todo.txt</code></pre>
+      <p>
+        <code>finished.txt</code> exists, so the command ran to the end while no agent was watching. This is the case the interrupted result is worded for: "may or may not have run". The agent could not have known, and running the command again would have written the file a second time.
+      </p>
+      <p>
+        <strong>The same on llama.cpp.</strong> A fresh session, one prompt, a restart and a question that needs the first prompt's history, with <code>PROVIDER=llamacpp</code>:
+      </p>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../src/index.ts
+You: List the files in this folder, then read notes/todo.txt
+[tool] list_files({"path":"."})
+[tool] read_file({"path":"notes/todo.txt"})
+Agent: The files in the current folder are:
+- `secret-file.txt`
+- `README.md`
+- `notes/`
+
+The content of `notes/todo.txt` is:
+- buy milk
+- water the plants
+You: ^D</code></pre>
+<pre class="transcript"><code>$ cd playground &amp;&amp; bun ../src/index.ts
+You: What was the second item in that todo file?
+Agent: The second item in the `notes/todo.txt` file was "water the plants".
+You: ^D</code></pre>
+      <p>
+        <strong>What the reload costs.</strong> Part 2 asked what rebuilding the history before every step buys, given that it is slower. It buys a loop with no second copy of the conversation to keep correct, and so a restart that is the same code as a normal step. This is the price. A log of 100, 1,000 and 10,000 events, in a mix of prompts, a step that calls a tool, a one-kilobyte tool result and a step that answers, was read and rebuilt into a history twenty times, including the query, the Schema decoding and the fold:
+      </p>
+      <table>
+        <tr><th>Events in the log</th><th>File size</th><th>Rebuild the history (median)</th></tr>
+        <tr><td>100</td><td>0.07 MB</td><td>0.2 ms</td></tr>
+        <tr><td>1,000</td><td>0.61 MB</td><td>0.9 ms</td></tr>
+        <tr><td>10,000</td><td>6.02 MB</td><td>8.7 ms</td></tr>
+      </table>
+      <p>
+        A step takes seconds on the local models in Part 7 (the whole reply took 9.4 s on Ollama and 13.2 s on llama.cpp), and a log of 10,000 events is already far longer than a model's context window can take, so the read is under one per cent of a step even for a log far larger than a model's context window can take. The cost grows with the log, which is what the projection tables in OpenCode are for.
+      </p>
+      <div class="callout">
+        <span class="callout-label">Watch for this</span>
+        A result is appended after the tool returns, so a tool that finished just before the process died is reported as interrupted. The restart cannot distinguish this from a tool that was killed halfway, and the interrupted message says "may or may not have run" for that reason. The model resolves it by looking at the files, as it tried to in the transcript above.
+      </div>
+      <div class="callout">
+        <span class="callout-label">Watch for this</span>
+        <code>migrationsFolder</code> is found from the location of <code>session.ts</code>. If the agent is copied or bundled without the <code>drizzle/</code> folder, the first run fails when it opens the database, with an error from the migrator and not from the agent. The folder is part of the program.
+      </div>
+      <div class="callout">
+        <span class="callout-label">Result</span>
+        Every prompt, step and tool result is in a SQLite file the moment it happens, and the loop keeps nothing between steps. A process killed in the middle of a tool call leaves a log from which the next run finishes the turn, without running the tool a second time. A failed turn is part of the record and absent from the conversation. The cost of reading the log before each step is under ten milliseconds for ten thousand events.
+      </div>
+
+      <h3 id="finished-files">The finished files</h3>
+      <p>
+        These are the files that differ from Part 7, plus the new test files. <code>events.ts</code>, <code>sse.ts</code>, <code>terminal.ts</code>, <code>model-client.ts</code>, <code>protocols.ts</code>, <code>provider.ts</code>, <code>tool.ts</code> and <code>tools.ts</code> are as Part 7 left them.
+      </p>
+<details class="reveal">
+<summary>package.json</summary>
+<p class="where"><code>package.json</code></p>
+<pre><code>{
+  "name": "my-agent",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "cd playground &amp;&amp; bun ../src/index.ts",
+    "start:llamacpp": "cd playground &amp;&amp; PROVIDER=llamacpp bun ../src/index.ts",
+    "start:claude": "cd playground &amp;&amp; PROVIDER=claude bun ../src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "reset": "sh reset-playground.sh",
+    "db:generate": "drizzle-kit generate",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "drizzle-kit": "1.0.0-rc.5"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@effect/sql-sqlite-bun": "4.1.0",
+    "drizzle-orm": "1.0.0-rc.5",
+    "effect": "4.1.0"
+  }
+}</code></pre>
+</details>
+<details class="reveal">
+<summary>drizzle.config.ts</summary>
+<p class="where"><code>drizzle.config.ts</code></p>
+<pre><code>import { defineConfig } from "drizzle-kit"
+
+export default defineConfig({
+  dialect: "sqlite",
+  schema: "./src/session-table.ts",
+  out: "./drizzle",
+})</code></pre>
+</details>
+<details class="reveal">
+<summary>drizzle/20261109205302_event_log/migration.sql</summary>
+<p class="where"><code>drizzle/20261109205302_event_log/migration.sql</code></p>
+<pre><code>CREATE TABLE `event` (
+	`session_id` text NOT NULL,
+	`seq` integer NOT NULL,
+	`type` text NOT NULL,
+	`data` text NOT NULL,
+	CONSTRAINT `event_pk` PRIMARY KEY(`session_id`, `seq`)
+);</code></pre>
+</details>
+<details class="reveal">
+<summary>src/session-table.ts</summary>
+<p class="where"><code>src/session-table.ts</code></p>
+<pre><code>import { integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core"
+
+// The event log: one row per session event. `seq` orders the events of a session.
+export const EventTable = sqliteTable(
+  "event",
+  {
+    session_id: text().notNull(),
+    seq: integer().notNull(),
+    type: text().notNull(),
+    data: text({ mode: "json" }).notNull(),
+  },
+  (table) =&gt; [primaryKey({ columns: [table.session_id, table.seq] })],
+)</code></pre>
+</details>
+<details class="reveal">
+<summary>src/messages.ts</summary>
+<p class="where"><code>src/messages.ts</code></p>
+<pre><code>import { Schema } from "effect"
+
+// The agent's own message types. No protocol appears in them. Each is a Schema, so the same definition
+// that gives the type also checks the messages read back from the session log.
+export const TextPart = Schema.Struct({ type: Schema.Literal("text"), text: Schema.String })
+export const ToolCallPart = Schema.Struct({
+  type: Schema.Literal("tool-call"),
+  id: Schema.String,
+  name: Schema.String,
+  input: Schema.Unknown,
+})
+export const ToolResultValue = Schema.Struct({ type: Schema.Literals(["text", "error"]), value: Schema.String })
+export const ToolResultPart = Schema.Struct({
+  type: Schema.Literal("tool-result"),
+  id: Schema.String,
+  name: Schema.String,
+  result: ToolResultValue,
+})
+export const Part = Schema.Union([TextPart, ToolCallPart, ToolResultPart])
+
+export const Message = Schema.Struct({
+  role: Schema.Literals(["user", "assistant", "tool"]),
+  content: Schema.mutable(Schema.Array(Part)),
+  // The provider's own content for this message, kept so the same protocol can send it back unchanged.
+  native: Schema.optional(Schema.Unknown),
+})
+
+export type TextPart = typeof TextPart.Type
+export type ToolCallPart = typeof ToolCallPart.Type
+export type ToolResultValue = typeof ToolResultValue.Type
+export type ToolResultPart = typeof ToolResultPart.Type
+export type Part = typeof Part.Type
+export type Message = typeof Message.Type
+
+export const isToolCall = (part: Part): part is ToolCallPart =&gt; part.type === "tool-call"
+export const textOf = (message: Message) =&gt; message.content.flatMap((part) =&gt; (part.type === "text" ? [part.text] : [])).join("\n")</code></pre>
+</details>
+<details class="reveal">
+<summary>src/errors.ts</summary>
+<p class="where"><code>src/errors.ts</code></p>
+<pre><code>import { Schema } from "effect"
+
+// Tool failures: each one becomes a tool result the model can read and react to.
+export class UnknownTool extends Schema.TaggedError&lt;UnknownTool&gt;()("UnknownTool", {
+  name: Schema.String,
+  available: Schema.Array(Schema.String),
+}) {
+  override get message() {
+    return `Unknown tool: ${this.name}. Available tools: ${this.available.join(", ")}`
+  }
+}
+
+export class InvalidInput extends Schema.TaggedError&lt;InvalidInput&gt;()("InvalidInput", {
+  tool: Schema.String,
+  problems: Schema.Array(Schema.String),
+  takes: Schema.String,
+}) {
+  override get message() {
+    return [`Invalid input for ${this.tool}:`, ...this.problems.map((problem) =&gt; `- ${problem}`), `${this.tool} takes an object with the fields: ${this.takes}`].join("\n")
+  }
+}
+
+export class Declined extends Schema.TaggedError&lt;Declined&gt;()("Declined", {}) {
+  override get message() {
+    return "User declined this action. Ask what they would like instead."
+  }
+}
+
+export class ToolCrashed extends Schema.TaggedError&lt;ToolCrashed&gt;()("ToolCrashed", {
+  tool: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message() {
+    return this.reason
+  }
+}
+
+// Failures of the model request. The user reads these; the model never sees them.
+export class ProviderError extends Schema.TaggedError&lt;ProviderError&gt;()("ProviderError", {
+  reason: Schema.String,
+}) {
+  override get message() {
+    return this.reason
+  }
+}
+
+// The environment asks for a provider the agent cannot reach, such as an unknown PROVIDER or a missing API key.
+export class ConfigError extends Schema.TaggedError&lt;ConfigError&gt;()("ConfigError", {
+  reason: Schema.String,
+}) {
+  override get message() {
+    return this.reason
+  }
+}
+
+// A stored session event that no longer matches the schema, such as a file edited by hand or written by an older version.
+export class SessionCorrupt extends Schema.TaggedError&lt;SessionCorrupt&gt;()("SessionCorrupt", {
+  session: Schema.String,
+  seq: Schema.Number,
+  problem: Schema.String,
+}) {
+  override get message() {
+    return `Session ${this.session} cannot be read: event ${this.seq} ${this.problem}`
+  }
+}
+
+// Standard input ended, so there is nobody left to ask.
+export class InputClosed extends Schema.TaggedError&lt;InputClosed&gt;()("InputClosed", {}) {}
+
+export const messageOf = (error: unknown) =&gt; (error instanceof Error ? error.message : String(error))</code></pre>
+</details>
+<details class="reveal">
+<summary>src/session-event.ts</summary>
+<p class="where"><code>src/session-event.ts</code></p>
+<pre><code>import { Schema } from "effect"
+import { Message, ToolResultPart } from "./messages"
+
+// The facts a session records. Nothing here can be worked out from the other events.
+export const Prompt = Schema.Struct({ type: Schema.Literal("prompt"), text: Schema.String })
+
+// One finished model call: the whole assistant message and why the step ended.
+export const StepFinished = Schema.Struct({
+  type: Schema.Literal("step-finished"),
+  message: Message,
+  finish: Schema.Literals(["tool-calls", "stop", "refusal"]),
+})
+
+// One tool call's result. A step with three calls appends three of these, one as soon as each finishes.
+export const ToolResult = Schema.Struct({ type: Schema.Literal("tool-result"), part: ToolResultPart })
+
+// The turn ended in an error. The history leaves the turn out; the log keeps it.
+export const TurnFailed = Schema.Struct({ type: Schema.Literal("turn-failed"), reason: Schema.String })
+
+export const SessionEvent = Schema.Union([Prompt, StepFinished, ToolResult, TurnFailed])
+export type SessionEvent = typeof SessionEvent.Type</code></pre>
+</details>
+<details class="reveal">
+<summary>src/history.ts</summary>
+<p class="where"><code>src/history.ts</code></p>
+<pre><code>import { isToolCall, type Message, type ToolCallPart } from "./messages"
+import type { SessionEvent } from "./session-event"
+
+// The messages the next step sends to the model, rebuilt from the session events.
+export const toHistory = (events: ReadonlyArray&lt;SessionEvent&gt;): Message[] =&gt; {
+  const history: Message[] = []
+  let turnStart = 0 // where the current turn began, so a failed turn can be left out
+
+  for (const event of events) {
+    if (event.type === "prompt") {
+      turnStart = history.length
+      history.push({ role: "user", content: [{ type: "text", text: event.text }] })
+    } else if (event.type === "step-finished") {
+      history.push(event.message)
+    } else if (event.type === "tool-result") {
+      // Results that follow one another belong to one tool message.
+      const last = history.at(-1)
+      if (last?.role === "tool") last.content.push(event.part)
+      else history.push({ role: "tool", content: [event.part] })
+    } else {
+      history.length = turnStart
+    }
+  }
+  return history
+}
+
+// What a restart finds when the last turn did not finish: the tool calls of the last step that have no result yet.
+// Returns undefined when the turn did finish, and an empty list when the model simply has to answer next.
+export const unansweredCalls = (history: ReadonlyArray&lt;Message&gt;): ToolCallPart[] | undefined =&gt; {
+  const last = history.at(-1)
+  if (!last) return undefined
+  if (last.role === "user") return []
+  const assistant = last.role === "tool" ? history.at(-2) : last
+  const calls = assistant?.content.filter(isToolCall) ?? []
+  if (last.role === "assistant" &amp;&amp; calls.length === 0) return undefined
+  const answered = last.role === "tool" ? last.content.flatMap((part) =&gt; (part.type === "tool-result" ? [part.id] : [])) : []
+  return calls.filter((call) =&gt; !answered.includes(call.id))
+}</code></pre>
+</details>
+<details class="reveal">
+<summary>src/session.ts</summary>
+<p class="where"><code>src/session.ts</code></p>
+<pre><code>import { SqliteClient } from "@effect/sql-sqlite-bun"
+import { asc, eq, max } from "drizzle-orm"
+import * as SQLiteBunDrizzle from "drizzle-orm/effect-sqlite-bun"
+import { migrate } from "drizzle-orm/effect-sqlite-bun/migrator"
+import { Context, Effect, Layer, Schema } from "effect"
+import { SessionCorrupt } from "./errors"
+import { toHistory } from "./history"
+import type { Message } from "./messages"
+import { SessionEvent } from "./session-event"
+import { EventTable } from "./session-table"
+
+// What the agent needs from its session: append a fact, and read the facts back.
+export class Session extends Context.Service&lt;
+  Session,
+  {
+    readonly id: string
+    readonly append: (event: SessionEvent) =&gt; Effect.Effect&lt;void&gt;
+    // Every call reads the log again.
+    readonly events: Effect.Effect&lt;SessionEvent[], SessionCorrupt&gt;
+    readonly history: Effect.Effect&lt;Message[], SessionCorrupt&gt;
+  }
+&gt;()("@agent/Session") {}
+
+const migrationsFolder = new URL("../drizzle", import.meta.url).pathname
+const decode = Schema.decodeUnknownEffect(SessionEvent)
+const encode = Schema.encodeSync(SessionEvent)
+
+// The real session: a SQLite file. Building the layer opens the file and applies the migrations;
+// the end of the program closes it. A disk failure is a defect, not something the agent can handle.
+export const SessionLive = (options: { path: string; id: string }) =&gt;
+  Layer.effect(
+    Session,
+    Effect.gen(function* () {
+      const db = yield* SQLiteBunDrizzle.makeWithDefaults()
+      yield* migrate(db, { migrationsFolder })
+
+      const thisSession = eq(EventTable.session_id, options.id)
+
+      // The numbering continues where the log stops. One process writes a session, so it can count for itself.
+      const [last] = yield* db.select({ seq: max(EventTable.seq) }).from(EventTable).where(thisSession)
+      let seq = last?.seq ?? 0
+
+      // A row that no longer matches the schema stops the read and says which event it was.
+      const readEvent = (row: typeof EventTable.$inferSelect) =&gt;
+        decode(row.data).pipe(
+          Effect.mapError((error) =&gt; new SessionCorrupt({ session: options.id, seq: row.seq, problem: error.message })),
+        )
+
+      const events = db.select().from(EventTable).where(thisSession).orderBy(asc(EventTable.seq)).pipe(
+        Effect.flatMap(Effect.forEach(readEvent)),
+        Effect.catchTag("EffectDrizzleQueryError", Effect.die),
+      )
+
+      const append = (event: SessionEvent) =&gt;
+        Effect.suspend(() =&gt;
+          db.insert(EventTable).values({ session_id: options.id, seq: ++seq, type: event.type, data: encode(event) }),
+        ).pipe(Effect.asVoid, Effect.orDie)
+
+      return Session.of({ id: options.id, append, events, history: Effect.map(events, toHistory) })
+    }).pipe(Effect.orDie),
+  ).pipe(Layer.provide(SqliteClient.layer({ filename: options.path }).pipe(Layer.orDie)))</code></pre>
+</details>
+<details class="reveal">
+<summary>src/agent.ts</summary>
+<p class="where"><code>src/agent.ts</code></p>
+<pre><code>import { Effect, Stream } from "effect"
+import { messageOf, type InputClosed, type ProviderError, type SessionCorrupt } from "./errors"
+import type { FinishReason } from "./events"
+import { unansweredCalls } from "./history"
+import { isToolCall, type Message, type Part } from "./messages"
+import { ModelClient } from "./model-client"
+import { Session } from "./session"
+import { Terminal } from "./terminal"
+import { runTool, Tools, type Tool } from "./tool"
+
+// One step: reload the history from the log, stream the model's events, show the text as it arrives,
+// and append the finished message to the log.
+const step = (tools: Tool[]) =&gt;
+  Effect.gen(function* () {
+    const model = yield* ModelClient
+    const terminal = yield* Terminal
+    const session = yield* Session
+    const history = yield* session.history
+    const content: Part[] = []
+    let text = "" // the text block being written, if any
+    const outcome: { finish: FinishReason; native?: unknown } = { finish: "stop" }
+
+    // A text block ends when anything else arrives, or when the stream does, even by failing.
+    const endText = Effect.suspend(() =&gt; {
+      if (!text) return Effect.void
+      content.push({ type: "text", text })
+      text = ""
+      return terminal.say("")
+    })
+
+    yield* Stream.runForEach(model.chat(history, tools), (event) =&gt;
+      Effect.gen(function* () {
+        if (event.type === "text-delta") {
+          if (!text) yield* terminal.write("Agent: ")
+          text += event.text
+          yield* terminal.write(event.text)
+          return
+        }
+        yield* endText
+        if (event.type === "tool-call") content.push(event)
+        else {
+          outcome.finish = event.reason
+          outcome.native = event.native
+        }
+      }),
+    ).pipe(Effect.ensuring(endText))
+
+    const message: Message = { role: "assistant", content, ...(outcome.native === undefined ? {} : { native: outcome.native }) }
+    yield* session.append({ type: "step-finished", message, finish: outcome.finish })
+    return { message, finish: outcome.finish }
+  })
+
+// Steps until the model stops asking for tools. Each result is appended as soon as its tool finishes.
+const run = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+  const tools = yield* Tools
+
+  while (true) {
+    const { message, finish } = yield* step(tools)
+    if (finish !== "tool-calls") return
+
+    for (const call of message.content.filter(isToolCall)) {
+      yield* terminal.say(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
+      const part = yield* runTool(call)
+      if (part.result.type === "error") yield* terminal.say(`[error] ${part.result.value}`)
+      yield* session.append({ type: "tool-result", part })
+    }
+  }
+})
+
+// One prompt: record it, then run steps until the turn is over.
+export const turn = (input: string) =&gt;
+  Effect.gen(function* () {
+    const session = yield* Session
+    yield* session.append({ type: "prompt", text: input })
+    yield* run
+  })
+
+const interrupted =
+  "The agent stopped before this tool finished, so it may or may not have run. Check the current state before repeating it."
+
+// A restart can find a turn that did not finish. Tool calls without a result get an error result instead of
+// running again, since a command that already ran must not run twice. Then the turn continues.
+const resume = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+  const calls = unansweredCalls(yield* session.history)
+  if (calls === undefined) return
+
+  yield* terminal.say(`[resuming session ${session.id}]`)
+  for (const call of calls) {
+    yield* terminal.say(`[interrupted] ${call.name}(${JSON.stringify(call.input)})`)
+    yield* session.append({
+      type: "tool-result",
+      part: { type: "tool-result", id: call.id, name: call.name, result: { type: "error", value: interrupted } },
+    })
+  }
+  yield* run
+})
+
+// The read-eval-print loop: finish an interrupted turn, then read a line from the user, run a turn on it,
+// print the output, and repeat.
+export const repl = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+
+  // A turn that fails is recorded as failed, so the next prompt starts from a consistent history.
+  const failed = (label: string, reason: string) =&gt;
+    session.append({ type: "turn-failed", reason }).pipe(Effect.andThen(terminal.say(`[${label}] ${reason}`)))
+  const guarded = &lt;R&gt;(work: Effect.Effect&lt;void, ProviderError | SessionCorrupt | InputClosed, R&gt;) =&gt;
+    work.pipe(
+      Effect.catchTag("ProviderError", (error) =&gt; failed("provider error", error.message)),
+      Effect.catchDefect((defect) =&gt; failed("bug", messageOf(defect))),
+    )
+
+  yield* guarded(resume)
+  while (true) {
+    const input = yield* terminal.ask("You: ")
+    yield* guarded(turn(input))
+  }
+}).pipe(Effect.catchTag("InputClosed", () =&gt; Effect.void))</code></pre>
+</details>
+<details class="reveal">
+<summary>src/index.ts</summary>
+<p class="where"><code>src/index.ts</code></p>
+<pre><code>import { Effect, Layer } from "effect"
+import { repl } from "./agent"
+import { ModelClientLive } from "./model-client"
+import { SessionLive } from "./session"
+import { TerminalLive } from "./terminal"
+import { ToolsLive } from "./tools"
+
+// The agent starts in playground/, so the default puts the database next to the project, outside the folder it works in.
+const live = Layer.mergeAll(
+  ModelClientLive,
+  TerminalLive,
+  ToolsLive,
+  SessionLive({ path: process.env.DB_PATH ?? "../my-agent.db", id: process.env.SESSION ?? "default" }),
+)
+
+const fail = (error: { message: string }) =&gt;
+  Effect.sync(() =&gt; {
+    console.error(error.message)
+    process.exitCode = 1
+  })
+
+await Effect.runPromise(
+  repl.pipe(
+    Effect.provide(live),
+    Effect.catchTags({ ConfigError: fail, SessionCorrupt: fail }),
+  ),
+)</code></pre>
+</details>
+<details class="reveal">
+<summary>test/agent.test.ts</summary>
+<p class="where"><code>test/agent.test.ts</code></p>
+<pre><code>import { describe, expect, test } from "bun:test"
+import { Effect, Layer, Schema } from "effect"
+import { repl } from "../src/agent"
+import { ProviderError } from "../src/errors"
+import { Session, SessionLive } from "../src/session"
+import { defineTool, Tools } from "../src/tool"
+import { callTool, fail, reply, scriptedModel, scriptedTerminal, type Step } from "./fakes"
+
+// Two small tools, so the tests never touch the disk.
+const echo = defineTool({
+  name: "echo",
+  description: "Returns its text.",
+  input: Schema.Struct({ text: Schema.String }),
+  execute: async ({ text }) =&gt; text,
+})
+
+const deleteEverything = defineTool({
+  name: "delete_everything",
+  description: "Pretends to delete everything.",
+  input: Schema.Struct({}),
+  execute: async () =&gt; "deleted",
+  confirm: () =&gt; "delete everything",
+})
+
+// Runs the loop against a script, on a session kept in memory, and returns what the loop and the fakes saw.
+const run = async (script: { model: Step[]; answers: string[] }) =&gt; {
+  const model = scriptedModel(script.model)
+  const terminal = scriptedTerminal(script.answers)
+  const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo, deleteEverything]), SessionLive({ path: ":memory:", id: "test" }))
+
+  const { history, events } = await Effect.runPromise(
+    Effect.gen(function* () {
+      yield* repl
+      const session = yield* Session
+      return { history: yield* session.history, events: yield* session.events }
+    }).pipe(Effect.provide(layers)),
+  )
+  return { history, events, requests: model.requests, output: terminal.output, writes: terminal.writes }
+}
+
+describe("the agent loop", () =&gt; {
+  test("runs a tool call and then answers", async () =&gt; {
+    const { history, output } = await run({
+      model: [callTool("call_1", "echo", { text: "hi" }), reply("The tool said hi.")],
+      answers: ["say hi"],
+    })
+
+    expect(history.map((message) =&gt; message.role)).toEqual(["user", "assistant", "tool", "assistant"])
+    expect(history[2]?.content).toEqual([{ type: "tool-result", id: "call_1", name: "echo", result: { type: "text", value: "hi" } }])
+    expect(output).toContain("Agent: The tool said hi.")
+  })
+
+  test("appends each fact to the log as it happens", async () =&gt; {
+    const { events } = await run({
+      model: [callTool("call_1", "echo", { text: "hi" }), reply("The tool said hi.")],
+      answers: ["say hi"],
+    })
+
+    expect(events.map((event) =&gt; event.type)).toEqual(["prompt", "step-finished", "tool-result", "step-finished"])
+  })
+
+  test("shows the reply piece by piece", async () =&gt; {
+    const { writes } = await run({ model: [reply("Hello there, friend.")], answers: ["hi"] })
+
+    expect(writes).toEqual(["Agent: ", "Hello ", "there, ", "friend."])
+  })
+
+  test("tells the model when the user declines", async () =&gt; {
+    const { requests } = await run({
+      model: [callTool("call_1", "delete_everything", {}), reply("Understood, I will not delete anything.")],
+      answers: ["clean up", "n"],
+    })
+
+    // The second request is the step after the tool call: its last message holds the result.
+    const result = requests[1]?.at(-1)?.content[0]
+    expect(result).toMatchObject({ type: "tool-result", result: { type: "error" } })
+    expect(JSON.stringify(result)).toContain("User declined")
+  })
+
+  test("ends the line of a reply that breaks off, then drops the turn", async () =&gt; {
+    const { history, events, output } = await run({
+      model: [[{ type: "text-delta", text: "The answer is" }, new ProviderError({ reason: "connection reset" })]],
+      answers: ["hello"],
+    })
+
+    expect(history).toEqual([])
+    expect(events.map((event) =&gt; event.type)).toEqual(["prompt", "turn-failed"])
+    expect(output).toContain("Agent: The answer is")
+    expect(output).toContain("[provider error] connection reset")
+  })
+
+  test("drops a turn whose model call fails", async () =&gt; {
+    const { history, output } = await run({
+      model: [fail("connection refused")],
+      answers: ["hello"],
+    })
+
+    expect(history).toEqual([])
+    expect(output).toContain("[provider error] connection refused")
+  })
+})</code></pre>
+</details>
+<details class="reveal">
+<summary>test/history.test.ts</summary>
+<p class="where"><code>test/history.test.ts</code></p>
+<pre><code>import { describe, expect, test } from "bun:test"
+import { toHistory, unansweredCalls } from "../src/history"
+import type { ToolResultPart } from "../src/messages"
+import type { SessionEvent } from "../src/session-event"
+
+const prompt = (text: string): SessionEvent =&gt; ({ type: "prompt", text })
+const answer = (text: string): SessionEvent =&gt; ({
+  type: "step-finished",
+  message: { role: "assistant", content: [{ type: "text", text }] },
+  finish: "stop",
+})
+const calls = (...ids: string[]): SessionEvent =&gt; ({
+  type: "step-finished",
+  message: { role: "assistant", content: ids.map((id) =&gt; ({ type: "tool-call", id, name: "echo", input: {} })) },
+  finish: "tool-calls",
+})
+const result = (id: string): SessionEvent =&gt; {
+  const part: ToolResultPart = { type: "tool-result", id, name: "echo", result: { type: "text", value: id } }
+  return { type: "tool-result", part }
+}
+const failed: SessionEvent = { type: "turn-failed", reason: "connection reset" }
+
+describe("toHistory", () =&gt; {
+  test("turns events into messages in order", () =&gt; {
+    const history = toHistory([prompt("hi"), answer("hello")])
+
+    expect(history.map((message) =&gt; message.role)).toEqual(["user", "assistant"])
+  })
+
+  test("puts results that follow one another in one tool message", () =&gt; {
+    const history = toHistory([prompt("go"), calls("a", "b"), result("a"), result("b")])
+
+    expect(history.map((message) =&gt; message.role)).toEqual(["user", "assistant", "tool"])
+    expect(history[2]?.content).toHaveLength(2)
+  })
+
+  test("leaves out a failed turn and keeps the turns before it", () =&gt; {
+    const history = toHistory([prompt("one"), answer("first"), prompt("two"), calls("a"), failed, prompt("three")])
+
+    expect(history.map((message) =&gt; message.role)).toEqual(["user", "assistant", "user"])
+  })
+})
+
+describe("unansweredCalls", () =&gt; {
+  test("is undefined when the last turn finished", () =&gt; {
+    expect(unansweredCalls(toHistory([prompt("hi"), answer("hello")]))).toBeUndefined()
+    expect(unansweredCalls(toHistory([prompt("hi"), failed]))).toBeUndefined()
+    expect(unansweredCalls([])).toBeUndefined()
+  })
+
+  test("is empty when the model has to answer next", () =&gt; {
+    expect(unansweredCalls(toHistory([prompt("hi")]))).toEqual([])
+    expect(unansweredCalls(toHistory([prompt("hi"), calls("a"), result("a")]))).toEqual([])
+  })
+
+  test("lists the calls that have no result", () =&gt; {
+    expect(unansweredCalls(toHistory([prompt("go"), calls("a", "b")]))?.map((call) =&gt; call.id)).toEqual(["a", "b"])
+    expect(unansweredCalls(toHistory([prompt("go"), calls("a", "b"), result("a")]))?.map((call) =&gt; call.id)).toEqual(["b"])
+  })
+})</code></pre>
+</details>
+<details class="reveal">
+<summary>test/resume.test.ts</summary>
+<p class="where"><code>test/resume.test.ts</code></p>
+<pre><code>import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { Effect, Layer, Schema } from "effect"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { repl } from "../src/agent"
+import type { SessionEvent } from "../src/session-event"
+import { Session, SessionLive } from "../src/session"
+import { defineTool, Tools } from "../src/tool"
+import { callTool, reply, scriptedModel, scriptedTerminal } from "./fakes"
+
+// A crash leaves the log as it was at the moment the process died. These tests write that log with
+// `append`, close the file, and start the agent again on it.
+let dir: string
+beforeEach(async () =&gt; {
+  dir = await mkdtemp(join(tmpdir(), "agent-session-"))
+})
+afterEach(() =&gt; rm(dir, { recursive: true, force: true }))
+
+const ran: string[] = []
+const echo = defineTool({
+  name: "echo",
+  description: "Returns its text.",
+  input: Schema.Struct({ text: Schema.String }),
+  execute: async ({ text }) =&gt; (ran.push(text), text),
+})
+
+const prompt = (text: string): SessionEvent =&gt; ({ type: "prompt", text })
+const calls = (...ids: string[]): SessionEvent =&gt; ({
+  type: "step-finished",
+  message: { role: "assistant", content: ids.map((id) =&gt; ({ type: "tool-call", id, name: "echo", input: { text: id } })) },
+  finish: "tool-calls",
+})
+const result = (id: string): SessionEvent =&gt; ({
+  type: "tool-result",
+  part: { type: "tool-result", id, name: "echo", result: { type: "text", value: id } },
+})
+
+// Process one: the events that were written before the crash.
+const crashAfter = (events: SessionEvent[]) =&gt;
+  Effect.runPromise(
+    Effect.gen(function* () {
+      const session = yield* Session
+      for (const event of events) yield* session.append(event)
+    }).pipe(Effect.provide(SessionLive({ path: join(dir, "agent.db"), id: "s" }))),
+  )
+
+// Process two: a new agent on the same file. No input, so it only finishes what it finds.
+const restart = async (modelSteps: Parameters&lt;typeof scriptedModel&gt;[0]) =&gt; {
+  const model = scriptedModel(modelSteps)
+  const terminal = scriptedTerminal([])
+  const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo]), SessionLive({ path: join(dir, "agent.db"), id: "s" }))
+  const events = await Effect.runPromise(
+    Effect.gen(function* () {
+      yield* repl
+      return yield* (yield* Session).events
+    }).pipe(Effect.provide(layers)),
+  )
+  return { events, requests: model.requests, output: terminal.output }
+}
+
+describe("resuming a session", () =&gt; {
+  test("answers a call that has no result with an error and never runs it again", async () =&gt; {
+    ran.length = 0
+    await crashAfter([prompt("go"), calls("a", "b"), result("a")])
+
+    const { events, requests, output } = await restart([reply("Understood.")])
+
+    expect(output[0]).toBe("[resuming session s]")
+    expect(ran).toEqual([])
+    const tool = requests[0]?.at(-1)
+    expect(tool?.role).toBe("tool")
+    expect(tool?.content.map((part) =&gt; (part.type === "tool-result" ? [part.id, part.result.type] : []))).toEqual([
+      ["a", "text"],
+      ["b", "error"],
+    ])
+    expect(JSON.stringify(tool)).toContain("stopped before this tool finished")
+    expect(events.map((event) =&gt; event.type)).toEqual(["prompt", "step-finished", "tool-result", "tool-result", "step-finished"])
+  })
+
+  test("continues a turn that stopped right after the prompt", async () =&gt; {
+    await crashAfter([prompt("hello")])
+
+    const { requests, output } = await restart([reply("Hi.")])
+
+    expect(output).toContain("Agent: Hi.")
+    expect(requests[0]?.map((message) =&gt; message.role)).toEqual(["user"])
+  })
+
+  test("continues a turn that stopped between the last result and the next step", async () =&gt; {
+    await crashAfter([prompt("go"), calls("a"), result("a")])
+
+    const { requests } = await restart([reply("Done.")])
+
+    expect(requests[0]?.map((message) =&gt; message.role)).toEqual(["user", "assistant", "tool"])
+  })
+
+  test("leaves a finished turn alone", async () =&gt; {
+    await crashAfter([prompt("hi"), { type: "step-finished", message: { role: "assistant", content: [{ type: "text", text: "Hello." }] }, finish: "stop" }])
+
+    const { requests, output } = await restart([])
+
+    expect(requests).toEqual([])
+    expect(output.join("\n")).not.toContain("resuming")
+  })
+
+  test("leaves a failed turn alone", async () =&gt; {
+    await crashAfter([prompt("hi"), { type: "turn-failed", reason: "connection reset" }])
+
+    const { requests, output } = await restart([])
+
+    expect(requests).toEqual([])
+    expect(output.join("\n")).not.toContain("resuming")
+  })
+
+  test("a resumed turn that calls a tool runs it like any other", async () =&gt; {
+    ran.length = 0
+    await crashAfter([prompt("go")])
+
+    await restart([callTool("c9", "echo", { text: "again" }), reply("Done.")])
+
+    expect(ran).toEqual(["again"])
+  })
+})</code></pre>
+</details>
+<details class="reveal">
+<summary>test/session.test.ts</summary>
+<p class="where"><code>test/session.test.ts</code></p>
+<pre><code>import { Database } from "bun:sqlite"
+import { afterEach, beforeEach, expect, test } from "bun:test"
+import { Effect } from "effect"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { SessionCorrupt } from "../src/errors"
+import { Session, SessionLive } from "../src/session"
+
+let path: string
+let dir: string
+beforeEach(async () =&gt; {
+  dir = await mkdtemp(join(tmpdir(), "agent-session-"))
+  path = join(dir, "agent.db")
+})
+afterEach(() =&gt; rm(dir, { recursive: true, force: true }))
+
+// Opens the file, runs `use`, and closes the file again, like one run of the agent.
+const using = &lt;A, E&gt;(id: string, use: (session: Session["Service"]) =&gt; Effect.Effect&lt;A, E&gt;) =&gt;
+  Effect.runPromise(Effect.gen(function* () { return yield* use(yield* Session) }).pipe(Effect.provide(SessionLive({ path, id }))))
+
+test("reads back what was appended, in order, after the file is closed and opened again", async () =&gt; {
+  await using("s", (session) =&gt; session.append({ type: "prompt", text: "one" }).pipe(Effect.andThen(session.append({ type: "prompt", text: "two" }))))
+
+  const events = await using("s", (session) =&gt; session.events)
+
+  expect(events).toEqual([
+    { type: "prompt", text: "one" },
+    { type: "prompt", text: "two" },
+  ])
+})
+
+test("keeps the events of two sessions apart", async () =&gt; {
+  await using("a", (session) =&gt; session.append({ type: "prompt", text: "for a" }))
+  await using("b", (session) =&gt; session.append({ type: "prompt", text: "for b" }))
+
+  expect(await using("b", (session) =&gt; session.events)).toEqual([{ type: "prompt", text: "for b" }])
+})
+
+test("names the event that does not match the schema", async () =&gt; {
+  await using("s", (session) =&gt; session.append({ type: "prompt", text: "hi" }))
+  const db = new Database(path)
+  db.run(`insert into event (session_id, seq, type, data) values ('s', 2, 'prompt', '{"type":"prompt"}')`)
+  db.close()
+
+  const error = await using("s", (session) =&gt; Effect.flip(session.events))
+
+  expect(error).toBeInstanceOf(SessionCorrupt)
+  expect(error).toMatchObject({ session: "s", seq: 2 })
+})</code></pre>
+</details>
+    </section>
+
+    <section>
+      <h2>Primary source for this post</h2>
+      <p>
+        OpenCode's <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/session/runner/step.ts" target="_blank" rel="noopener">session/runner/step.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/session/history.ts" target="_blank" rel="noopener">session/history.ts</a> and <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/session/execution/restart.ts" target="_blank" rel="noopener">session/execution/restart.ts</a> are the full versions of what this post builds. They store sessions as projected message tables with durable claims, a persistent inbox and compaction, all of which Parts 9 and 10 take one at a time.
+      </p>
+      <p>
+        This part starts Stage B. Part 9 separates saving a prompt from running it: a prompt becomes durable the moment it is accepted, and a queued prompt runs on restart even if the process died before the model saw it.
+      </p>
+    </section>
+
+    <ul class="sources">
+      <li>Source: <a href="https://orm.drizzle.team/docs/get-started/bun-sqlite-new" target="_blank" rel="noopener">Drizzle docs: Get started with Drizzle and Bun:SQLite</a></li>
+      <li>Source: OpenCode's <a href="https://github.com/anomalyco/opencode/blob/97be25f046/AGENTS.md" target="_blank" rel="noopener">AGENTS.md</a> (the Session Core section and the event rules), <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/session/sql.ts#L86-L102" target="_blank" rel="noopener">session/sql.ts</a>, <a href="https://github.com/anomalyco/opencode/blob/97be25f046/packages/core/src/database/database.ts" target="_blank" rel="noopener">database/database.ts</a></li>
+      <li>Measured: the steps above were run on 9 November 2026 in the Part 1 test environment with Effect 4.1.0, Bun 1.4.4, drizzle-orm and drizzle-kit 1.0.0-rc.5 and @effect/sql-sqlite-bun 4.1.0. Every step's files were type-checked and tested, the finished files were run on Ollama 0.40.14 and on llama.cpp b9830 (a second llama-server on another port with <code>--reasoning off</code>, selected with <code>BASE_URL</code>) with piped input, and the typed lines were added to the transcripts where a terminal would echo them. The crash was a SIGKILL sent to the agent process during a tool call, and the transcript shows the two runs it needed. The timings are the median of twenty reads on a file database after a warm-up read. Long lines in transcripts are shortened. The tests were also run with the two deliberate changes shown in step 6, to confirm that they fail.</li>
+    </ul>
+  </main>
+  <script src="../assets/quiz.js"></script>
+</body>
+</html>
