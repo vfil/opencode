@@ -417,6 +417,53 @@ details.reveal[open] summary {
   margin-bottom: 0.6rem;
 }
 
+/* Copy button: assets/copy-code.js wraps each <pre> in .code-block and adds the button. */
+.code-block {
+  position: relative;
+  margin: 1rem 0;
+}
+
+.code-block pre {
+  margin: 0;
+}
+
+.copy-button {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.7rem;
+  line-height: 1;
+  padding: 0.35rem 0.6rem;
+  color: var(--muted);
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.code-block:hover .copy-button,
+.copy-button:focus-visible,
+.copy-button[data-state] {
+  opacity: 1;
+}
+
+.copy-button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.copy-button[data-state="done"] {
+  color: var(--correct);
+  border-color: var(--correct);
+}
+
+.copy-button[data-state="failed"] {
+  color: var(--wrong);
+  border-color: var(--wrong);
+}
+
 /* Compare: two code panels side by side, stacked on narrow screens. */
 .compare {
   display: grid;
@@ -496,6 +543,7 @@ th {
   }
   .nav-links,
   .ask-claude,
+  .copy-button,
   .quiz {
     display: none;
   }

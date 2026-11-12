@@ -97,3 +97,21 @@ _Avoid_: Journal, transcript, message table
 **History**:
 The messages the next step sends to the model, rebuilt from the event log before every step. It is derived and never stored on its own.
 _Avoid_: Context, conversation, projection
+
+## Accepting and running prompts
+
+**Inbox**:
+The prompts a session has accepted but not yet run, oldest first. A prompt is in exactly one place: the inbox or the event log, never both and never neither.
+_Avoid_: Queue, buffer, backlog
+
+**Admit**:
+To accept a prompt into the inbox. Once admitted, a prompt survives a restart, whether or not the model has seen it.
+_Avoid_: Enqueue, submit, save
+
+**Deliver**:
+To move the oldest prompt out of the inbox and into the event log as a prompt event, in one indivisible act. A delivered prompt starts a turn.
+_Avoid_: Dequeue, consume, dispatch
+
+**Wake**:
+A signal that tells the agent to look at the inbox. It carries no prompt and several wakes may merge into one; the inbox is the truth and the wake is only a hint.
+_Avoid_: Notify, trigger, poll
