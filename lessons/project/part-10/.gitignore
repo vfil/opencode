@@ -1,0 +1,6 @@
+node_modules
+.env
+
+# The repository root ignores every folder named "playground"; this project tracks its seed files.
+!playground
+my-agent.db*

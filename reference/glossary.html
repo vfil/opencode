@@ -98,6 +98,16 @@
     <h3>Wake</h3>
     <p>A signal that tells the agent to look at the inbox. It carries no prompt and several wakes may merge into one; the inbox is the truth and the wake is only a hint.</p>
     <p class="where">Avoid: Notify, trigger, poll</p>
+    <h2>Context limits</h2>
+    <h3>Context window</h3>
+    <p>The most tokens a model takes in for one step, the reply included.</p>
+    <p class="where">Avoid: Context length, context size, memory</p>
+    <h3>Compaction</h3>
+    <p>Replacing everything before a point in the history with a summary, recorded as a session event. The event log keeps every original event.</p>
+    <p class="where">Avoid: Truncation, pruning, compression</p>
+    <h3>Summary</h3>
+    <p>The text a compaction writes, which the next step reads in place of the events it covers.</p>
+    <p class="where">Avoid: Checkpoint, digest</p>
   </main>
 </body>
 </html>

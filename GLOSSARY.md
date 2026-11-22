@@ -115,3 +115,17 @@ _Avoid_: Dequeue, consume, dispatch
 **Wake**:
 A signal that tells the agent to look at the inbox. It carries no prompt and several wakes may merge into one; the inbox is the truth and the wake is only a hint.
 _Avoid_: Notify, trigger, poll
+
+## Context limits
+
+**Context window**:
+The most tokens a model takes in for one step, the reply included.
+_Avoid_: Context length, context size, memory
+
+**Compaction**:
+Replacing everything before a point in the history with a summary, recorded as a session event. The event log keeps every original event.
+_Avoid_: Truncation, pruning, compression
+
+**Summary**:
+The text a compaction writes, which the next step reads in place of the events it covers.
+_Avoid_: Checkpoint, digest
