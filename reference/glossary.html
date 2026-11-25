@@ -108,6 +108,31 @@
     <h3>Summary</h3>
     <p>The text a compaction writes, which the next step reads in place of the events it covers.</p>
     <p class="where">Avoid: Checkpoint, digest</p>
+    <h2>Permissions</h2>
+    <h3>Permission rule</h3>
+    <p>A statement that requests for one action on matching resources are allowed, asked about or denied. When several rules match, the last one wins; when none matches, the agent asks.</p>
+    <p class="where">Avoid: Policy, guard, filter</p>
+    <h3>Action</h3>
+    <p>The kind of access a tool call needs, such as reading files, editing files or running a command. Several tools can share one action.</p>
+    <p class="where">Avoid: Permission name, tool name</p>
+    <h3>Resource</h3>
+    <p>What an action is applied to: a path relative to the working directory, or a command as written.</p>
+    <p class="where">Avoid: Target, subject, argument</p>
+    <h3>Permission effect</h3>
+    <p>What a rule says about a matching request: allow, ask or deny.</p>
+    <p class="where">Avoid: Decision, verdict, outcome</p>
+    <h3>Ruleset</h3>
+    <p>An ordered list of permission rules, read from the last rule back.</p>
+    <p class="where">Avoid: Policy, permission config</p>
+    <h3>Saved approval</h3>
+    <p>An "always" answer kept across runs. It settles a request that would otherwise ask, and never overrides a deny.</p>
+    <p class="where">Avoid: Remembered permission, allowlist entry</p>
+    <h3>Decline</h3>
+    <p>A plain "no" to a request. The call gets an error result and the turn stops.</p>
+    <p class="where">Avoid: Reject, refuse, cancel</p>
+    <h3>Correction</h3>
+    <p>A "no" that says what to do instead. The model receives it as the call's result and the turn continues.</p>
+    <p class="where">Avoid: Feedback, redirect</p>
   </main>
 </body>
 </html>

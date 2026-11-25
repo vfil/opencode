@@ -157,8 +157,8 @@
 
           <div class="module">
             <h4>Permissions</h4>
-            <p>Ask before risky tools run. A "no" goes back to the model as a result it can react to, not as a crash.</p>
-            <p class="milestone">A y/n prompt before <code>write_file</code> and <code>bash</code>; denials the model adapts to.</p>
+            <p>Ask before risky tools run. A plain "no" stops the turn. A "no" with a note goes back to the model as a result it can react to.</p>
+            <p class="milestone">Allow/ask/deny rules, an "always" answer, and declines that stop the turn or redirect the model.</p>
             <p class="where">In OpenCode: <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/permission.ts" target="_blank" rel="noopener">packages/core/src/permission.ts</a>; the decline handling described in <a href="https://github.com/anomalyco/opencode/blob/863ea41364/packages/core/src/tool/AGENTS.md" target="_blank" rel="noopener">tool/AGENTS.md</a>.</p>
           </div>
 

@@ -129,3 +129,37 @@ _Avoid_: Truncation, pruning, compression
 **Summary**:
 The text a compaction writes, which the next step reads in place of the events it covers.
 _Avoid_: Checkpoint, digest
+
+## Permissions
+
+**Permission rule**:
+A statement that requests for one action on matching resources are allowed, asked about or denied. When several rules match, the last one wins; when none matches, the agent asks.
+_Avoid_: Policy, guard, filter
+
+**Action**:
+The kind of access a tool call needs, such as reading files, editing files or running a command. Several tools can share one action.
+_Avoid_: Permission name, tool name
+
+**Resource**:
+What an action is applied to: a path relative to the working directory, or a command as written.
+_Avoid_: Target, subject, argument
+
+**Permission effect**:
+What a rule says about a matching request: allow, ask or deny.
+_Avoid_: Decision, verdict, outcome
+
+**Ruleset**:
+An ordered list of permission rules, read from the last rule back.
+_Avoid_: Policy, permission config
+
+**Saved approval**:
+An "always" answer kept across runs. It settles a request that would otherwise ask, and never overrides a deny.
+_Avoid_: Remembered permission, allowlist entry
+
+**Decline**:
+A plain "no" to a request. The call gets an error result and the turn stops.
+_Avoid_: Reject, refuse, cancel
+
+**Correction**:
+A "no" that says what to do instead. The model receives it as the call's result and the turn continues.
+_Avoid_: Feedback, redirect
